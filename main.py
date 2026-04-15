@@ -1,22 +1,31 @@
-# main.py
 import os
 import uuid
-import asyncio
+import json
 import tempfile
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
-from fastapi.responses import JSONResponse
 
 from detector import InterviewCheatingDetector
 
 app = FastAPI()
 
-# In-memory job store (use Redis for production scale)
-jobs = {}
+JOBS_DIR = Path("/tmp/jobs")
+JOBS_DIR.mkdir(exist_ok=True)
 
-def run_analysis(job_id: str, video_path: str, student_id: str):
+def save_job(job_id, data):
+    with open(JOBS_DIR / f"{job_id}.json", "w") as f:
+        json.dump(data, f)
+
+def load_job(job_id):
+    p = JOBS_DIR / f"{job_id}.json"
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+def run_analysis(job_id, video_path, student_id):
     try:
-        jobs[job_id] = {"status": "processing"}
+        save_job(job_id, {"status": "processing"})
         detector = InterviewCheatingDetector(
             video_path=video_path,
             student_id=student_id,
@@ -28,9 +37,9 @@ def run_analysis(job_id: str, video_path: str, student_id: str):
             dir_window_s=35.0,
         )
         result = detector.analyze()
-        jobs[job_id] = {"status": "done", "result": result.to_dict()}
+        save_job(job_id, {"status": "done", "result": result.to_dict()})
     except Exception as e:
-        jobs[job_id] = {"status": "failed", "error": str(e)}
+        save_job(job_id, {"status": "failed", "error": str(e)})
     finally:
         try:
             Path(video_path).unlink()
@@ -53,9 +62,9 @@ async def analyze(
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    job = jobs.get(job_id)
+    job = load_job(job_id)
     if not job:
-        return JSONResponse({"status": "not_found"}, status_code=404)
+        return {"status": "processing"}
     return job
 
 @app.get("/health")
