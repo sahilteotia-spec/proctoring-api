@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+opencv-python-headless
+mediapipe
+openai
+numpy
+ultralytics
+pytesseract
+Pillow
+python-multipart
