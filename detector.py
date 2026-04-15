@@ -916,6 +916,7 @@ class InterviewCheatingDetector:
 
         offscreen_start = None
         offscreen_dir   = None
+        down_start_time=None
         processed       = 0
         yolo            = self._load_yolo()
         phone_counter=0
@@ -939,7 +940,7 @@ class InterviewCheatingDetector:
                 current_time = frame_idx / fps
                 
                 if current_time > 600 :   # start after 10 mins, stop once found
-                    if current_time - last_coding_check > (120 if coding_phase else 60):  # check every 60 sec till 600sec and then 120 sec after detection
+                    if current_time - last_coding_check > (180 if coding_phase else 120):  # check every 60 sec till 600sec and then 120 sec after detection
                         coding_phase = detect_coding_phase(frame)
                         last_coding_check = current_time
                         print(f"[CONTEXT] Coding phase = {coding_phase} at t={current_time:.0f}s")
@@ -973,7 +974,7 @@ class InterviewCheatingDetector:
                 real_faces = sum(
                     1 for det in (fd.detections or [])
                     if det.location_data.relative_bounding_box.width *
-                    det.location_data.relative_bounding_box.height > 0.08
+                    det.location_data.relative_bounding_box.height > 0.15
                 )
 
                 if real_faces > 1:
@@ -997,6 +998,20 @@ class InterviewCheatingDetector:
                         gaze_x = 0.5
 
                     direction = classify_gaze_direction(yaw, pitch, gaze_x, interviewer_side)
+                 
+
+                    #  FILTER SHORT DOWN GLANCES
+                    if direction == "DOWN":
+                        if down_start_time is None:
+                            down_start_time = current_time
+
+                        duration = current_time - down_start_time
+
+                        if duration < 0.8:
+                            continue  # ignore tiny down glance
+                    else:
+                        down_start_time = None  # reset when not down
+
                     gaze_log.append({"time_s": round(current_time,2), "direction": direction})
 
                     # ================= FIXED LOGIC START =================
@@ -1007,6 +1022,20 @@ class InterviewCheatingDetector:
                         else:
                             elapsed = current_time - offscreen_start
                             recent_events = gaze_log[-15:]
+                            #  FILTER: ignore normal behavior (too much CENTER)
+                            center_count = sum(1 for e in recent_events if e["direction"] == "CENTER")
+
+                            if center_count > len(recent_events) * 0.3:
+                                continue
+                            
+                             # Typing suppression (MAIN FIX)
+                            if direction == "DOWN":
+                                if is_typing_pattern(recent_events):
+                                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- typing detected")
+                                        offscreen_start = None
+                                        offscreen_dir   = None
+                                        continue
+
 
                           # dynamic threshold based on coding phase
                             if direction == "DOWN":
@@ -1021,14 +1050,7 @@ class InterviewCheatingDetector:
                             if elapsed >= threshold:
                                 speaking = is_speaking(current_time, transcript_segments) if has_transcript else False
 
-                                # Typing suppression (MAIN FIX)
-                                if direction == "DOWN":
-                                    if is_typing_pattern(recent_events):
-                                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- typing detected")
-                                        offscreen_start = None
-                                        offscreen_dir   = None
-                                        continue
-
+                               
                                 if not speaking:
                                     sev = "LOW" if direction == "DOWN" and not has_transcript else "MEDIUM"
                                     add_v(
@@ -1151,12 +1173,12 @@ class InterviewCheatingDetector:
         }
 
         # sustained_gaze without a transcript is much weaker evidence -- weight it less
-        sustained_weight = 8 if has_transcript else 3
+        sustained_weight = 12 if has_transcript else 6
 
         raw = (
             counts["third_person_detected"]      * 25 +
             counts["phone_detected"]             * 22 +
-            min(counts["repeated_direction_pattern"] * 20, 40) +
+            min(counts["repeated_direction_pattern"] * 6, 40) +
             counts["prohibited_object"]          * 15 +
             counts["sustained_gaze"]             * sustained_weight
         )
