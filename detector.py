@@ -940,7 +940,7 @@ class InterviewCheatingDetector:
                 current_time = frame_idx / fps
                 
                 if current_time > 600 :   # start after 10 mins, stop once found
-                    if current_time - last_coding_check > (180 if coding_phase else 120):  # check every 60 sec till 600sec and then 120 sec after detection
+                    if current_time - last_coding_check > (300 if coding_phase else 180):  # check every 200 sec till 600sec and then 300 sec after detection
                         coding_phase = detect_coding_phase(frame)
                         last_coding_check = current_time
                         print(f"[CONTEXT] Coding phase = {coding_phase} at t={current_time:.0f}s")
