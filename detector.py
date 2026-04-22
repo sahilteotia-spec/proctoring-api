@@ -7,6 +7,7 @@ def excepthook(type, value, tb):
 sys.excepthook = excepthook
 
 import os
+import re
 import cv2
 import json
 import tempfile
@@ -42,6 +43,47 @@ MODEL_POINTS = np.array([
 ], dtype=np.float64)
 
 
+# ==============================================================================
+# Speech naturalness regexes (local, zero API cost)
+# ==============================================================================
+
+STRUCTURED_CONNECTORS = re.compile(
+    r"\b(firstly|secondly|thirdly|in\s+conclusion|to\s+summarize|"
+    r"in\s+summary|to\s+conclude|lastly|finally,\s+I\s+would|"
+    r"in\s+addition\s+to\s+that|moving\s+on\s+to|as\s+a\s+result\s+of)\b",
+    re.IGNORECASE,
+)
+
+BOOKISH_PHRASES = re.compile(
+    r"\b(it\s+is\s+important\s+to\s+note|furthermore|moreover|"
+    r"it\s+is\s+worth\s+mentioning|one\s+must\s+consider|"
+    r"this\s+can\s+be\s+attributed|in\s+the\s+context\s+of|"
+    r"it\s+should\s+be\s+noted|as\s+previously\s+mentioned|"
+    r"in\s+other\s+words|to\s+elaborate\s+on\s+this|"
+    r"a\s+key\s+aspect\s+of|plays\s+a\s+crucial\s+role)\b",
+    re.IGNORECASE,
+)
+
+HESITATION_WORDS = re.compile(
+    r"\b(um+|uh+|hmm+|err+|ah+|like,|you\s+know,|i\s+mean,|"
+    r"sort\s+of|kind\s+of|basically|honestly|literally|right\?)\b",
+    re.IGNORECASE,
+)
+
+SELF_CORRECTIONS = re.compile(
+    r"\b(i\s+mean|no\s+wait|actually,|correction|sorry,\s+i\s+meant|"
+    r"let\s+me\s+rephrase|what\s+i\s+meant\s+to\s+say)\b",
+    re.IGNORECASE,
+)
+
+CONTRACTIONS = re.compile(
+    r"\b(i'm|i've|i'll|i'd|don't|doesn't|didn't|can't|won't|"
+    r"wouldn't|couldn't|shouldn't|it's|that's|there's|we're|"
+    r"they're|you're|wasn't|aren't|isn't)\b",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class Violation:
     frame:    int
@@ -53,44 +95,48 @@ class Violation:
 
 @dataclass
 class DetectionResult:
-    student_id:         str
-    video_path:         str
-    duration_s:         float
-    total_frames:       int
-    processed_frames:   int
-    interviewee_name:   str  = "unknown"
-    interviewee_region: dict = field(default_factory=dict)
-    transcript_full:    str  = ""
-    transcript_summary: str  = ""
-    interview_topic:    str  = ""
-    violations:         list = field(default_factory=list)
-    gaze_pattern:       dict = field(default_factory=dict)
-    cheating_score:     int  = 0
-    risk_level:         str  = "LOW"
-    counts:             dict = field(default_factory=dict)
-    timeline:           list = field(default_factory=list)
-    summary:            str  = ""
+    student_id:          str
+    video_path:          str
+    duration_s:          float
+    total_frames:        int
+    processed_frames:    int
+    interviewee_name:    str  = "unknown"
+    interviewee_region:  dict = field(default_factory=dict)
+    transcript_full:     str  = ""
+    transcript_summary:  str  = ""
+    interview_topic:     str  = ""
+    violations:          list = field(default_factory=list)
+    gaze_pattern:        dict = field(default_factory=dict)
+    speech_naturalness:  dict = field(default_factory=dict)
+    cheating_score:      int  = 0
+    risk_level:          str  = "LOW"
+    counts:              dict = field(default_factory=dict)
+    timeline:            list = field(default_factory=list)
+    summary:             str  = ""
 
     def to_dict(self):
         return {
-            "student_id":         self.student_id,
-            "video_path":         self.video_path,
-            "duration_s":         round(self.duration_s, 2),
-            "total_frames":       self.total_frames,
-            "processed_frames":   self.processed_frames,
-            "interviewee_name":   self.interviewee_name,
-            "interviewee_region": self.interviewee_region,
-            "transcript_full":    self.transcript_full,
-            "transcript_summary": self.transcript_summary,
-            "interview_topic":    self.interview_topic,
-            "cheating_score":     self.cheating_score,
-            "risk_level":         self.risk_level,
-            "total_violations":   len(self.violations),
-            "gaze_pattern":       self.gaze_pattern,
-            "counts":             self.counts,
-            "violations":         [v.__dict__ for v in self.violations],  # ALL violations, no cap
-            "timeline":           self.timeline,
-            "summary":            self.summary,
+            "student_id":          self.student_id,
+            "video_path":          self.video_path,
+            "duration_s":          round(self.duration_s, 2),
+            "total_frames":        self.total_frames,
+            "processed_frames":    self.processed_frames,
+            "interviewee_name":    self.interviewee_name,
+            "interviewee_region":  self.interviewee_region,
+            "transcript_full":     self.transcript_full,
+            "transcript_summary":  self.transcript_summary,
+            "interview_topic":     self.interview_topic,
+            "cheating_score":      self.cheating_score,
+            "risk_level":          self.risk_level,
+            "total_violations":    len(self.violations),
+            "gaze_pattern":        self.gaze_pattern,
+            "speech_naturalness":  self.speech_naturalness,
+            "ai_speech_score":     self.speech_naturalness.get("overall_ai_speech_score", 0),
+            "speech_risk":         self.speech_naturalness.get("speech_risk", "LOW"),
+            "counts":              self.counts,
+            "violations":          [v.__dict__ for v in self.violations],
+            "timeline":            self.timeline,
+            "summary":             self.summary,
         }
 
 
@@ -356,8 +402,6 @@ def _ocr_find_name(video_path: str, interviewee_name: str, frame_w: int, frame_h
 def _openai_vision_find_interviewee(video_path: str, interviewee_name: Optional[str], frame_w: int, frame_h: int) -> Optional[dict]:
     """Uses GPT-4o vision to locate the interviewee tile."""
     try:
-        import base64
-
         cap          = cv2.VideoCapture(video_path)
         frame_to_use = None
 
@@ -543,13 +587,10 @@ def classify_gaze_direction(yaw: float, pitch: float, gaze_x: float, interviewer
     else:
         return "CENTER"
 
-    
-
     return raw
 
 
 def is_speaking(time_s: float, segments: list, window: float = 1.5) -> bool:
-    """Returns True if a transcript segment overlaps the given time window."""
     for seg in segments:
         if seg["start"] <= time_s + window and seg["end"] >= time_s - window:
             return True
@@ -683,23 +724,14 @@ def detect_direction_patterns(gaze_log: list, min_occurrences: int = 4, window_s
 
 
 def is_typing_pattern(events):
-    down_count = sum(1 for e in events if e["direction"] == "DOWN")
+    down_count   = sum(1 for e in events if e["direction"] == "DOWN")
     center_count = sum(1 for e in events if e["direction"] == "CENTER")
-
-    total = len(events)
+    total        = len(events)
     if total == 0:
         return False
-
-    down_ratio = down_count / total
-    center_ratio = center_count / total
-
-    # typing = frequent down + some center
-    if down_ratio > 0.35 and center_ratio > 0.2:
+    if down_count / total > 0.35 and center_count / total > 0.2:
         return True
-
     return False
-
-
 
 
 def time_since_last_speech(t, segments):
@@ -720,6 +752,170 @@ def is_interviewer_speaking(t, segments):
 
 
 # ==============================================================================
+# Speech naturalness analysis (local, zero API cost)
+# ==============================================================================
+
+def _score_segment_locally(text: str, word_count: int, pause_before_s: float) -> dict:
+    signals = {}
+    score   = 0
+
+    conn_hits = STRUCTURED_CONNECTORS.findall(text)
+    if conn_hits:
+        signals["structured_connectors"] = conn_hits
+        score += min(len(conn_hits) * 15, 30)
+
+    book_hits = BOOKISH_PHRASES.findall(text)
+    if book_hits:
+        signals["bookish_phrases"] = book_hits
+        score += min(len(book_hits) * 12, 24)
+
+    if word_count >= 30:
+        if not HESITATION_WORDS.search(text) and not SELF_CORRECTIONS.search(text):
+            signals["zero_hesitation"] = True
+            score += 20
+
+    if word_count >= 25:
+        if not CONTRACTIONS.search(text):
+            signals["no_contractions"] = True
+            score += 10
+
+    if pause_before_s >= 4.0 and word_count >= 20:
+        signals["pause_then_clean"] = round(pause_before_s, 1)
+        score += min(int(pause_before_s * 2), 20)
+
+    return {"signals": signals, "local_score": min(score, 100)}
+
+
+def _build_speech_reason(signals: dict) -> str:
+    parts = []
+    if "structured_connectors" in signals:
+        parts.append(f"structured connectors ({signals['structured_connectors']})")
+    if "bookish_phrases" in signals:
+        parts.append(f"formal/bookish phrases ({signals['bookish_phrases']})")
+    if signals.get("zero_hesitation"):
+        parts.append("long answer with zero hesitation words")
+    if signals.get("no_contractions"):
+        parts.append("no contractions in long answer")
+    if "pause_then_clean" in signals:
+        parts.append(f"clean burst after {signals['pause_then_clean']}s pause")
+    return "; ".join(parts) if parts else "multiple scripted-speech signals"
+
+
+def analyze_speech_naturalness(transcript_segments: list, min_local_score: int = 30) -> dict:
+    """
+    Detects AI-assisted / scripted speech using local regex signals only.
+    No API calls — zero extra cost.
+
+    Signals: structured connectors, bookish formality, zero hesitation,
+             no contractions, pause → clean burst.
+    """
+    empty = {
+        "flagged_segments":        [],
+        "overall_ai_speech_score": 0,
+        "speech_risk":             "LOW",
+        "summary_signals":         [],
+        "violations":              [],
+    }
+
+    if not transcript_segments:
+        return empty
+
+    print(f"\n[SPEECH] Analyzing {len(transcript_segments)} segments for AI-like speech (local, no API)...")
+
+    # Enrich segments with pause_before_s
+    enriched = []
+    for i, seg in enumerate(transcript_segments):
+        pause = max(0.0, seg["start"] - transcript_segments[i-1]["end"]) if i > 0 else 0.0
+        enriched.append({
+            "start_s":        seg["start"],
+            "end_s":          seg["end"],
+            "text":           seg["text"],
+            "word_count":     len(seg["text"].split()),
+            "pause_before_s": round(pause, 2),
+        })
+
+    # Score every segment
+    all_flagged = []
+    for seg in enriched:
+        scored = _score_segment_locally(seg["text"], seg["word_count"], seg["pause_before_s"])
+        if scored["local_score"] >= min_local_score:
+            all_flagged.append({
+                "start_s":        seg["start_s"],
+                "end_s":          seg["end_s"],
+                "text":           seg["text"],
+                "ai_probability": scored["local_score"],
+                "signals":        list(scored["signals"].keys()),
+                "reason":         _build_speech_reason(scored["signals"]),
+            })
+
+    all_flagged.sort(key=lambda x: x["start_s"])
+    print(f"[SPEECH] {len(all_flagged)} suspicious segments (score >= {min_local_score})")
+
+    # Overall score
+    if not all_flagged:
+        overall = 0
+    else:
+        avg        = sum(f["ai_probability"] for f in all_flagged) / len(all_flagged)
+        freq_boost = min(len(all_flagged) * 4, 25)
+        overall    = min(100, int(avg * 0.75 + freq_boost))
+
+    # Summary signals
+    signal_counter: dict = {}
+    for f in all_flagged:
+        for s in f["signals"]:
+            signal_counter[s] = signal_counter.get(s, 0) + 1
+    summary_signals = [
+        f"{s} (x{c})"
+        for s, c in sorted(signal_counter.items(), key=lambda x: -x[1])
+    ]
+
+    # Risk level
+    if overall >= 55:
+        speech_risk = "HIGH"
+    elif overall >= 25:
+        speech_risk = "MEDIUM"
+    else:
+        speech_risk = "LOW"
+
+    # Violations with cooldown
+    violations     = []
+    COOLDOWN_S     = 20.0
+    last_flagged_t = -999.0
+
+    for f in all_flagged:
+        if f["ai_probability"] < 40:
+            continue
+        if f["start_s"] - last_flagged_t < COOLDOWN_S:
+            continue
+
+        sev     = "HIGH" if f["ai_probability"] >= 65 else "MEDIUM"
+        excerpt = f["text"][:80] + ("..." if len(f["text"]) > 80 else "")
+        violations.append({
+            "frame":    0,
+            "time_s":   round(f["start_s"], 2),
+            "type":     "ai_assisted_speech",
+            "detail":   (
+                f"[{f['ai_probability']}% scripted] {f['reason']} | "
+                f"signals={f['signals']} | excerpt: \"{excerpt}\""
+            ),
+            "severity": sev,
+        })
+        last_flagged_t = f["start_s"]
+
+    print(f"[SPEECH] overall_score={overall} | risk={speech_risk} | violations={len(violations)}")
+    for v in violations:
+        print(f"         [{v['severity']}] t={v['time_s']}s  {v['detail'][:110]}")
+
+    return {
+        "flagged_segments":        all_flagged,
+        "overall_ai_speech_score": overall,
+        "speech_risk":             speech_risk,
+        "summary_signals":         summary_signals,
+        "violations":              violations,
+    }
+
+
+# ==============================================================================
 # Main detector class
 # ==============================================================================
 class InterviewCheatingDetector:
@@ -729,7 +925,6 @@ class InterviewCheatingDetector:
         student_id:             str   = "",
         process_every_n_frames: int   = 3,
         offscreen_duration_s:   float = 8.0,
-      
         cooldown_s:             float = 15.0,
         dir_min_occurrences:    int   = 6,
         dir_window_s:           float = 35.0,
@@ -738,14 +933,10 @@ class InterviewCheatingDetector:
         self.student_id    = student_id or Path(video_path).stem
         self.process_every = process_every_n_frames
         self.offscreen_dur = offscreen_duration_s
-       
         self.cooldown      = cooldown_s
         self.dir_min_occ   = dir_min_occurrences
         self.dir_window    = dir_window_s
         self._last_v: dict = {}
-       
-
- 
 
     def _can_add(self, vtype, t):
         if t - self._last_v.get(vtype, -999) >= self.cooldown:
@@ -781,7 +972,7 @@ class InterviewCheatingDetector:
         interview_topic     = ""
         interviewee_name    = None
         transcript_segments = []
-        has_transcript      = False  # <- track whether we have real speech timing data
+        has_transcript      = False
 
         audio_path = extract_audio(self.video_path)
         if audio_path:
@@ -807,7 +998,33 @@ class InterviewCheatingDetector:
         result.transcript_summary = transcript_summary
         result.interview_topic    = interview_topic
 
-        # -- PHASE 2: Find interviewee region ----------------------------------
+        # -- PHASE 1b: Speech naturalness analysis (local, zero API cost) --------
+        print(f"\n[PHASE 1b] Speech naturalness / AI-assisted speech detection")
+        violations_from_speech  = []
+        speech_naturalness_result = {
+            "flagged_segments": [], "overall_ai_speech_score": 0,
+            "speech_risk": "LOW", "summary_signals": [], "violations": [],
+        }
+
+        if has_transcript and transcript_segments:
+            speech_naturalness_result  = analyze_speech_naturalness(transcript_segments)
+            result.speech_naturalness  = speech_naturalness_result
+
+            for sv in speech_naturalness_result["violations"]:
+                violations_from_speech.append(
+                    Violation(
+                        frame    = sv["frame"],
+                        time_s   = sv["time_s"],
+                        type     = sv["type"],
+                        detail   = sv["detail"],
+                        severity = sv["severity"],
+                    )
+                )
+        else:
+            print("[PHASE 1b] Skipping -- no transcript available")
+            result.speech_naturalness = speech_naturalness_result
+
+        # -- PHASE 2: Find interviewee region ------------------------------------
         print(f"\n[PHASE 2] Locating interviewee on screen")
         region = find_interviewee_region_by_ocr(
             self.video_path, interviewee_name, frame_w, frame_h
@@ -820,25 +1037,18 @@ class InterviewCheatingDetector:
         print(f"[PHASE 2] Region: ({x1},{y1})->({x2},{y2}) size={crop_w}x{crop_h} method={region['method']}")
         print(f"[PHASE 2] Interviewer is on {interviewer_side} side -- glances that direction will be ignored")
 
-        # -- Compute adaptive thresholds based on whether transcript exists --
-        # Without audio we can't distinguish "silent = suspicious" vs "silent = no mic"
-        # so we require a much longer, more obvious sustained gaze to flag anything.
         if has_transcript:
-            # Normal operation: flag DOWN after 20s, LEFT/RIGHT after offscreen_dur
-            down_flag_dur      = 20.0
-            lr_flag_dur        = self.offscreen_dur
-            down_flag_msg      = "(silent per transcript)"
+            down_flag_dur = 20.0
+            lr_flag_dur   = self.offscreen_dur
+            down_flag_msg = "(silent per transcript)"
         else:
-            # No transcript: only flag truly egregious gaze (45s DOWN, 25s LEFT/RIGHT)
-            down_flag_dur      = 45.0
-            lr_flag_dur        = 25.0
-            down_flag_msg      = "(no transcript -- conservative threshold)"
+            down_flag_dur = 45.0
+            lr_flag_dur   = 25.0
+            down_flag_msg = "(no transcript -- conservative threshold)"
 
         print(f"[PHASE 3] Thresholds -- DOWN: {down_flag_dur}s | LEFT/RIGHT: {lr_flag_dur}s | transcript={'YES' if has_transcript else 'NO'}")
-        
-       # -- PHASE 3: Frame-by-frame detection ---------------------------------
-    
 
+        # -- PHASE 3: Frame-by-frame gaze detection ------------------------------
         print(f"\n[PHASE 3] Gaze-only detection (clean logic)")
 
         cap        = cv2.VideoCapture(self.video_path)
@@ -873,7 +1083,7 @@ class InterviewCheatingDetector:
                 if not ret:
                     break
 
-                frame_idx += 1
+                frame_idx   += 1
                 current_time = frame_idx / fps
 
                 if frame_idx % self.process_every != 0:
@@ -891,20 +1101,18 @@ class InterviewCheatingDetector:
                 def add_v(vtype, detail, severity="MEDIUM"):
                     if self._can_add(vtype, current_time):
                         violations.append(
-                            Violation(frame_idx, round(current_time,2), vtype, detail, severity)
+                            Violation(frame_idx, round(current_time, 2), vtype, detail, severity)
                         )
                         timeline[bucket]["violations"] += 1
 
-                # -------- Face detection --------
                 fd = face_det.process(rgb)
 
                 if not fd.detections:
-                    gaze_log.append({"time_s": round(current_time,2), "direction": "ABSENT"})
+                    gaze_log.append({"time_s": round(current_time, 2), "direction": "ABSENT"})
                     offscreen_start = None
                     offscreen_dir   = None
                     continue
 
-                # -------- Face mesh --------
                 mesh = face_mesh.process(rgb)
                 if not mesh.multi_face_landmarks:
                     continue
@@ -925,19 +1133,16 @@ class InterviewCheatingDetector:
 
                 direction = classify_gaze_direction(yaw, pitch, gaze_x, interviewer_side)
 
-                # -------- filter short down glances --------
                 if direction == "DOWN":
                     if down_start_time is None:
                         down_start_time = current_time
-
                     if current_time - down_start_time < 0.8:
                         continue
                 else:
                     down_start_time = None
 
-                gaze_log.append({"time_s": round(current_time,2), "direction": direction})
+                gaze_log.append({"time_s": round(current_time, 2), "direction": direction})
 
-                # ================= CORE LOGIC =================
                 if direction in ["LEFT", "RIGHT", "DOWN"]:
 
                     if offscreen_start is None:
@@ -945,66 +1150,58 @@ class InterviewCheatingDetector:
                         offscreen_dir   = direction
                         continue
 
-                    elapsed = current_time - offscreen_start
+                    elapsed       = current_time - offscreen_start
                     recent_events = gaze_log[-40:]
 
-                    # -------- speaking / listening (TOP PRIORITY) --------
-                    speaking = is_speaking(current_time, transcript_segments) if has_transcript else False
+                    speaking             = is_speaking(current_time, transcript_segments) if has_transcript else False
                     interviewer_speaking = is_interviewer_speaking(current_time, transcript_segments) if has_transcript else False
 
                     if speaking or interviewer_speaking:
-                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- Speaking/Listening detected")
+                        print(f"[GAZE] Suppressed at t={current_time:.0f}s -- Speaking/Listening detected")
                         offscreen_start = None
                         offscreen_dir   = None
                         continue
 
-                    # -------- typing suppression --------
                     if direction == "DOWN" and has_transcript and is_typing_pattern(recent_events):
                         print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- typing detected")
                         offscreen_start = None
                         offscreen_dir   = None
                         continue
 
-                    # -------- ignore normal behavior --------
                     center_count = sum(1 for e in recent_events if e["direction"] == "CENTER")
                     if center_count > len(recent_events) * 0.3:
                         offscreen_start = None
                         continue
 
-                    # -------- thresholds --------
-                    if direction == "DOWN":
-                        threshold = down_flag_dur
-                    else:
-                        threshold = lr_flag_dur
+                    threshold = down_flag_dur if direction == "DOWN" else lr_flag_dur
 
                     if elapsed >= threshold:
-
                         silence_gap = (
                             time_since_last_speech(current_time, transcript_segments)
                             if has_transcript else 999
                         )
-
                         if silence_gap > 6:
                             sev = "LOW" if direction == "DOWN" and not has_transcript else "MEDIUM"
-
                             add_v(
                                 "sustained_gaze",
                                 f"Looking {direction} continuously for {elapsed:.1f}s {down_flag_msg}",
                                 sev
                             )
-
                         offscreen_start = current_time
                         offscreen_dir   = direction
 
                 else:
                     offscreen_start = None
                     offscreen_dir   = None
-                # =================================================
 
         cap.release()
 
+        # Merge speech violations into main list
+        violations.extend(violations_from_speech)
+
         print(f"[PHASE 3] Processed {processed} frames, {len(gaze_log)} gaze readings, {len(violations)} raw violations")
-        # -- PHASE 4: Pattern analysis ------------------------------------------
+
+        # -- PHASE 4: Pattern analysis -------------------------------------------
         print(f"\n[PHASE 4] Gaze direction pattern analysis")
 
         patterns = detect_direction_patterns(
@@ -1017,14 +1214,14 @@ class InterviewCheatingDetector:
         total_tracked    = len(gaze_log) or 1
 
         gaze_pattern = {
-            "LEFT_pct":   round(direction_counts.get("LEFT", 0)   / total_tracked * 100, 1),
-            "RIGHT_pct":  round(direction_counts.get("RIGHT", 0)  / total_tracked * 100, 1),
-            "DOWN_pct":   round(direction_counts.get("DOWN", 0)   / total_tracked * 100, 1),
-            "CENTER_pct": round(direction_counts.get("CENTER", 0) / total_tracked * 100, 1),
-            "ABSENT_pct": round(direction_counts.get("ABSENT", 0) / total_tracked * 100, 1),
+            "LEFT_pct":             round(direction_counts.get("LEFT",   0) / total_tracked * 100, 1),
+            "RIGHT_pct":            round(direction_counts.get("RIGHT",  0) / total_tracked * 100, 1),
+            "DOWN_pct":             round(direction_counts.get("DOWN",   0) / total_tracked * 100, 1),
+            "CENTER_pct":           round(direction_counts.get("CENTER", 0) / total_tracked * 100, 1),
+            "ABSENT_pct":           round(direction_counts.get("ABSENT", 0) / total_tracked * 100, 1),
             "total_glances_logged": len(gaze_log),
-            "repeated_patterns": patterns,
-            "has_transcript": has_transcript,
+            "repeated_patterns":    patterns,
+            "has_transcript":       has_transcript,
         }
 
         print(f"[PHASE 4] LEFT={gaze_pattern['LEFT_pct']}% RIGHT={gaze_pattern['RIGHT_pct']}% DOWN={gaze_pattern['DOWN_pct']}% CENTER={gaze_pattern['CENTER_pct']}% ABSENT={gaze_pattern['ABSENT_pct']}%")
@@ -1033,47 +1230,44 @@ class InterviewCheatingDetector:
         for p in patterns:
             print(f"          -> {p['detail']}")
 
-        # Add violations for repeated patterns
         for p in patterns:
             if self._can_add(f"pattern{p['direction']}", p["time_s"]):
                 violations.append(Violation(
-                    0,
-                    p["time_s"],
-                    "repeated_direction_pattern",
-                    p["detail"],
-                    "HIGH"
+                    0, p["time_s"], "repeated_direction_pattern", p["detail"], "HIGH"
                 ))
 
-        # -- SCORING (Gaze-only, realistic weights) ------------------------------
-
+        # -- SCORING ---------------------------------------------------------------
         counts = {
             "sustained_gaze":             sum(1 for v in violations if v.type == "sustained_gaze"),
             "repeated_direction_pattern": sum(1 for v in violations if v.type == "repeated_direction_pattern"),
+            "ai_assisted_speech":         sum(1 for v in violations if v.type == "ai_assisted_speech"),
         }
 
-        pattern_weight   = 12   # strong signal
-        sustained_weight = 5    # weak signal 
+        pattern_weight   = 12
+        sustained_weight = 5
 
         raw = (
             min(counts["repeated_direction_pattern"] * pattern_weight, 60) +
             counts["sustained_gaze"] * sustained_weight
         )
 
-        # dominance boost (more strict now)
+        # Speech score contributes up to 30 points
+        speech_score = speech_naturalness_result.get("overall_ai_speech_score", 0)
+        raw += int(speech_score * 0.30)
+
+        # Dominance boost
         dominant_pct = max(
             gaze_pattern["LEFT_pct"],
             gaze_pattern["RIGHT_pct"],
             gaze_pattern["DOWN_pct"]
         )
-
         if dominant_pct > 75:
             boost = 10
-            raw += boost
+            raw  += boost
             print(f"[SCORE] Direction dominance boost: +{boost} ({dominant_pct:.0f}% off-center)")
 
         score = min(100, raw)
 
-        # risk thresholds (adjusted for gaze-only)
         if score >= 55:
             risk = "HIGH"
         elif score >= 25:
@@ -1081,15 +1275,14 @@ class InterviewCheatingDetector:
         else:
             risk = "LOW"
 
-        # -- SUMMARY -------------------------------------------------------------
-
+        # -- SUMMARY ---------------------------------------------------------------
         parts = []
 
         if not has_transcript:
             parts.append("[WARN] No transcript -- gaze-only analysis")
 
         if counts["repeated_direction_pattern"] > 0:
-            dirs = [p["direction"] for p in patterns]
+            dirs     = [p["direction"] for p in patterns]
             dominant = Counter(dirs).most_common(1)[0][0] if dirs else "unknown"
             parts.append(f"Repeated {dominant} look {counts['repeated_direction_pattern']}x")
 
@@ -1105,10 +1298,14 @@ class InterviewCheatingDetector:
         if gaze_pattern["DOWN_pct"] > 35:
             parts.append(f"Eyes DOWN {gaze_pattern['DOWN_pct']}%")
 
+        speech_risk = speech_naturalness_result.get("speech_risk", "LOW")
+        if speech_risk in ["MEDIUM", "HIGH"]:
+            sig_str = ", ".join(speech_naturalness_result.get("summary_signals", [])[:3])
+            parts.append(f"AI-speech risk={speech_risk} [{sig_str}]")
+
         summary = " | ".join(parts) if parts else "No suspicious activity detected"
 
-        # -- FINAL OUTPUT --------------------------------------------------------
-
+        # -- FINAL OUTPUT ----------------------------------------------------------
         print(f"\n[RESULT] Score={score}/100 | Risk={risk}")
         print(f"[RESULT] {summary}")
         print(f"[RESULT] Violations breakdown: {counts}")
@@ -1118,8 +1315,6 @@ class InterviewCheatingDetector:
             print(f"         [{v.severity}] t={v.time_s}s  {v.type}: {v.detail}")
 
         print(f"{'='*60}\n")
-
-        # -- STORE RESULT --------------------------------------------------------
 
         result.violations       = violations
         result.processed_frames = processed
