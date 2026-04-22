@@ -1,6 +1,10 @@
-# -*- coding: utf-8 -*-
+import sys
+import traceback
 
+def excepthook(type, value, tb):
+    print("".join(traceback.format_exception(type, value, tb)))
 
+sys.excepthook = excepthook
 
 import os
 import cv2
@@ -539,8 +543,7 @@ def classify_gaze_direction(yaw: float, pitch: float, gaze_x: float, interviewer
     else:
         return "CENTER"
 
-    if raw == interviewer_side:
-        return "CENTER"
+    
 
     return raw
 
@@ -679,99 +682,41 @@ def detect_direction_patterns(gaze_log: list, min_occurrences: int = 4, window_s
     return sorted(patterns, key=lambda p: p["time_s"])
 
 
-def is_typing_pattern(window_events):
-    if len(window_events) < 8:
-        return False
-    gaps = [
-        window_events[i]["time_s"] - window_events[i-1]["time_s"]
-        for i in range(1, len(window_events))
-    ]
-    if not gaps:
-        return False
-    avg_gap = sum(gaps) / len(gaps)
-    gap_std = np.std(gaps)
-    return avg_gap < 3.5 and gap_std > 1.0
+def is_typing_pattern(events):
+    down_count = sum(1 for e in events if e["direction"] == "DOWN")
+    center_count = sum(1 for e in events if e["direction"] == "CENTER")
 
-
-
-
-def detect_coding_phase(frame):
-    try:
-        # encode frame → base64
-        _, buffer = cv2.imencode(".jpg", frame)
-        img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Is this screen showing a coding environment like VS Code, terminal, or code editor? Answer strictly with one word : YES or NO."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_base64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=5
-        )
-
-        answer = response.choices[0].message.content.strip().upper()
-
-        return "YES" in answer
-
-    except Exception as e:
-        print(f"[VISION] Error detecting coding phase: {e}")
+    total = len(events)
+    if total == 0:
         return False
 
-# ==============================================================================
-# GPT-4o phone verification -- called only after YOLO detects phone 5x in a row
-# Prevents false positives from YOLO misclassifying remotes, notebooks, hands etc.
-# ==============================================================================
-def _verify_phone_with_gpt4o(rgb_frame) -> bool:
-    """Returns True only if GPT-4o confirms a phone is visible in the frame."""
-    try:
-        _, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR),
-                              [cv2.IMWRITE_JPEG_QUALITY, 75])
-        b64 = base64.b64encode(buf).decode("utf-8")
+    down_ratio = down_count / total
+    center_ratio = center_count / total
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=10,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Look at this image carefully. Is there a mobile phone or smartphone "
-                            "clearly visible being held or placed in front of a person? "
-                            "Do NOT count laptops, tablets, remotes, books, notebooks, or hands without a phone. "
-                            "Reply with only YES or NO."
-                        )
-                    }
-                ]
-            }]
-        )
+    # typing = frequent down + some center
+    if down_ratio > 0.35 and center_ratio > 0.2:
+        return True
 
-        answer = response.choices[0].message.content.strip().upper()
-        print(f"[PHONE] GPT-4o verification answer: {answer}")
-        return "YES" in answer
+    return False
 
-    except Exception as e:
-        print(f"[PHONE] GPT-4o verification failed: {e} -- defaulting to YOLO result")
-        return True  # if GPT call fails, trust YOLO to avoid silently missing real phones
+
+
+
+def time_since_last_speech(t, segments):
+    last_end = 0
+    for seg in segments:
+        if seg["end"] <= t:
+            last_end = seg["end"]
+    return t - last_end
+
+
+def is_interviewer_speaking(t, segments):
+    for seg in segments:
+        if seg["start"] <= t <= seg["end"]:
+            text = seg.get("text", "").lower()
+            if "?" in text or len(text.split()) > 12:
+                return True
+    return False
 
 
 # ==============================================================================
@@ -784,7 +729,7 @@ class InterviewCheatingDetector:
         student_id:             str   = "",
         process_every_n_frames: int   = 3,
         offscreen_duration_s:   float = 8.0,
-        object_conf:            float = 0.75,
+      
         cooldown_s:             float = 15.0,
         dir_min_occurrences:    int   = 6,
         dir_window_s:           float = 35.0,
@@ -793,22 +738,14 @@ class InterviewCheatingDetector:
         self.student_id    = student_id or Path(video_path).stem
         self.process_every = process_every_n_frames
         self.offscreen_dur = offscreen_duration_s
-        self.obj_conf      = object_conf
+       
         self.cooldown      = cooldown_s
         self.dir_min_occ   = dir_min_occurrences
         self.dir_window    = dir_window_s
         self._last_v: dict = {}
-        self._yolo         = None
+       
 
-    def _load_yolo(self):
-        if self._yolo is None:
-            try:
-                from ultralytics import YOLO
-                self._yolo = YOLO("yolov8n.pt")
-            except Exception as e:
-                print(f"[YOLO] Unavailable: {e}")
-                self._yolo = False
-        return self._yolo
+ 
 
     def _can_add(self, vtype, t):
         if t - self._last_v.get(vtype, -999) >= self.cooldown:
@@ -899,38 +836,38 @@ class InterviewCheatingDetector:
 
         print(f"[PHASE 3] Thresholds -- DOWN: {down_flag_dur}s | LEFT/RIGHT: {lr_flag_dur}s | transcript={'YES' if has_transcript else 'NO'}")
         
-        # -- PHASE 3: Frame-by-frame detection ---------------------------------
-        print(f"\n[PHASE 3] CV detection on interviewee region")
-        
-        
-        coding_phase=False
-        last_coding_check=0
+       # -- PHASE 3: Frame-by-frame detection ---------------------------------
+    
+
+        print(f"\n[PHASE 3] Gaze-only detection (clean logic)")
 
         cap        = cv2.VideoCapture(self.video_path)
         violations = []
         gaze_log   = []
 
-        bucket_size     = 10
-        n_buckets       = max(1, int(duration_s / bucket_size) + 1)
-        timeline        = [{"time_s": i*bucket_size, "violations": 0} for i in range(n_buckets)]
+        bucket_size = 10
+        n_buckets   = max(1, int(duration_s / bucket_size) + 1)
+        timeline    = [{"time_s": i*bucket_size, "violations": 0} for i in range(n_buckets)]
 
         offscreen_start = None
         offscreen_dir   = None
-        down_start_time=None
+        down_start_time = None
         processed       = 0
-        yolo            = self._load_yolo()
-        phone_counter=0
 
         with mp_face_mesh.FaceMesh(
-            static_image_mode=False, max_num_faces=2,
+            static_image_mode=False,
+            max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         ) as face_mesh, \
         mp_face_detect.FaceDetection(
-            model_selection=0, min_detection_confidence=0.5,
+            model_selection=0,
+            min_detection_confidence=0.5,
         ) as face_det:
 
             frame_idx = 0
+
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -938,12 +875,6 @@ class InterviewCheatingDetector:
 
                 frame_idx += 1
                 current_time = frame_idx / fps
-                
-                if current_time > 600 :   # start after 10 mins, stop once found
-                    if current_time - last_coding_check > (300 if coding_phase else 180):  # check every 200 sec till 600sec and then 300 sec after detection
-                        coding_phase = detect_coding_phase(frame)
-                        last_coding_check = current_time
-                        print(f"[CONTEXT] Coding phase = {coding_phase} at t={current_time:.0f}s")
 
                 if frame_idx % self.process_every != 0:
                     continue
@@ -959,271 +890,236 @@ class InterviewCheatingDetector:
 
                 def add_v(vtype, detail, severity="MEDIUM"):
                     if self._can_add(vtype, current_time):
-                        violations.append(Violation(frame_idx, round(current_time,2), vtype, detail, severity))
+                        violations.append(
+                            Violation(frame_idx, round(current_time,2), vtype, detail, severity)
+                        )
                         timeline[bucket]["violations"] += 1
 
+                # -------- Face detection --------
                 fd = face_det.process(rgb)
-                n_faces = len(fd.detections) if fd.detections else 0
 
-                if n_faces == 0:
+                if not fd.detections:
                     gaze_log.append({"time_s": round(current_time,2), "direction": "ABSENT"})
                     offscreen_start = None
                     offscreen_dir   = None
                     continue
 
-                real_faces = sum(
-                    1 for det in (fd.detections or [])
-                    if det.location_data.relative_bounding_box.width *
-                    det.location_data.relative_bounding_box.height > 0.15
-                )
-
-                if real_faces > 1:
-                    add_v("third_person_detected",
-                        f"{real_faces} people in interviewee frame -- possible coaching", "HIGH")
-
+                # -------- Face mesh --------
                 mesh = face_mesh.process(rgb)
-                if mesh.multi_face_landmarks:
-                    lm = mesh.multi_face_landmarks[0].landmark
+                if not mesh.multi_face_landmarks:
+                    continue
 
-                    try:
-                        pitch, yaw, roll = get_head_pose(lm, crop_w, crop_h)
-                    except:
-                        pitch, yaw, roll = 0, 0, 0
+                lm = mesh.multi_face_landmarks[0].landmark
 
-                    try:
-                        lg     = get_iris_gaze(lm, LEFT_IRIS,  LEFT_EAR_H,  crop_w, crop_h)
-                        rg     = get_iris_gaze(lm, RIGHT_IRIS, RIGHT_EAR_H, crop_w, crop_h)
-                        gaze_x = (lg + rg) / 2
-                    except:
-                        gaze_x = 0.5
+                try:
+                    pitch, yaw, roll = get_head_pose(lm, crop_w, crop_h)
+                except:
+                    pitch, yaw, roll = 0, 0, 0
 
-                    direction = classify_gaze_direction(yaw, pitch, gaze_x, interviewer_side)
-                 
+                try:
+                    lg     = get_iris_gaze(lm, LEFT_IRIS,  LEFT_EAR_H,  crop_w, crop_h)
+                    rg     = get_iris_gaze(lm, RIGHT_IRIS, RIGHT_EAR_H, crop_w, crop_h)
+                    gaze_x = (lg + rg) / 2
+                except:
+                    gaze_x = 0.5
 
-                    #  FILTER SHORT DOWN GLANCES
-                    if direction == "DOWN":
-                        if down_start_time is None:
-                            down_start_time = current_time
+                direction = classify_gaze_direction(yaw, pitch, gaze_x, interviewer_side)
 
-                        duration = current_time - down_start_time
+                # -------- filter short down glances --------
+                if direction == "DOWN":
+                    if down_start_time is None:
+                        down_start_time = current_time
 
-                        if duration < 0.8:
-                            continue  # ignore tiny down glance
-                    else:
-                        down_start_time = None  # reset when not down
+                    if current_time - down_start_time < 0.8:
+                        continue
+                else:
+                    down_start_time = None
 
-                    gaze_log.append({"time_s": round(current_time,2), "direction": direction})
+                gaze_log.append({"time_s": round(current_time,2), "direction": direction})
 
-                    # ================= FIXED LOGIC START =================
-                    if direction in ["LEFT", "RIGHT", "DOWN"]:
-                        if offscreen_start is None:
-                            offscreen_start = current_time
-                            offscreen_dir   = direction
-                        else:
-                            elapsed = current_time - offscreen_start
-                            recent_events = gaze_log[-15:]
-                            #  FILTER: ignore normal behavior (too much CENTER)
-                            center_count = sum(1 for e in recent_events if e["direction"] == "CENTER")
+                # ================= CORE LOGIC =================
+                if direction in ["LEFT", "RIGHT", "DOWN"]:
 
-                            if center_count > len(recent_events) * 0.3:
-                                continue
-                            
-                             # Typing suppression (MAIN FIX)
-                            if direction == "DOWN":
-                                if is_typing_pattern(recent_events):
-                                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- typing detected")
-                                        offscreen_start = None
-                                        offscreen_dir   = None
-                                        continue
+                    if offscreen_start is None:
+                        offscreen_start = current_time
+                        offscreen_dir   = direction
+                        continue
 
+                    elapsed = current_time - offscreen_start
+                    recent_events = gaze_log[-40:]
 
-                          # dynamic threshold based on coding phase
-                            if direction == "DOWN":
-                                if coding_phase:
-                                    threshold = 30.0   # relaxed (coding)
-                                else:
-                                    threshold = 20.0   # strict (non-coding)
-                            else:
-                                threshold = lr_flag_dur
-                                
+                    # -------- speaking / listening (TOP PRIORITY) --------
+                    speaking = is_speaking(current_time, transcript_segments) if has_transcript else False
+                    interviewer_speaking = is_interviewer_speaking(current_time, transcript_segments) if has_transcript else False
 
-                            if elapsed >= threshold:
-                                speaking = is_speaking(current_time, transcript_segments) if has_transcript else False
-
-                               
-                                if not speaking:
-                                    sev = "LOW" if direction == "DOWN" and not has_transcript else "MEDIUM"
-                                    add_v(
-                                        "sustained_gaze",
-                                        f"Looking {direction} continuously for {elapsed:.1f}s {down_flag_msg}",
-                                        sev
-                                    )
-                                else:
-                                    print(f"[GAZE] Suppressed sustained {direction} at t={current_time:.0f}s -- person is speaking")
-
-                                # Reset after evaluation
-                                offscreen_start = current_time
-                                offscreen_dir   = direction
-                    else:
+                    if speaking or interviewer_speaking:
+                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- Speaking/Listening detected")
                         offscreen_start = None
                         offscreen_dir   = None
-                    # ================= FIXED LOGIC END =================
+                        continue
 
-                # Object detection
-                if yolo and frame_idx % 15 == 0:
-                    try:
-                        phone_in_frame = False  # defined ONCE per frame, outside result loop
+                    # -------- typing suppression --------
+                    if direction == "DOWN" and has_transcript and is_typing_pattern(recent_events):
+                        print(f"[GAZE] Suppressed DOWN at t={current_time:.0f}s -- typing detected")
+                        offscreen_start = None
+                        offscreen_dir   = None
+                        continue
 
-                        for r in yolo(rgb, verbose=False, conf=self.obj_conf):
-                            for box in r.boxes:
-                                cls = yolo.model.names[int(box.cls)].lower()
+                    # -------- ignore normal behavior --------
+                    center_count = sum(1 for e in recent_events if e["direction"] == "CENTER")
+                    if center_count > len(recent_events) * 0.3:
+                        offscreen_start = None
+                        continue
 
-                                # size filtering -- ignore tiny detections
-                                bx1, by1, bx2, by2 = box.xyxy[0]
-                                bw = bx2 - bx1
-                                bh = by2 - by1
-                                area = bw * bh
+                    # -------- thresholds --------
+                    if direction == "DOWN":
+                        threshold = down_flag_dur
+                    else:
+                        threshold = lr_flag_dur
 
-                                if area < 5000:
-                                    continue
+                    if elapsed >= threshold:
 
-                                # center filtering -- ignore detections far to the edge
-                                frame_center_x = crop_w / 2
-                                box_center_x   = (bx1 + bx2) / 2
-                                if abs(box_center_x - frame_center_x) > crop_w * 0.4:
-                                    continue
+                        silence_gap = (
+                            time_since_last_speech(current_time, transcript_segments)
+                            if has_transcript else 999
+                        )
 
-                                # phone candidate
-                                if "phone" in cls:
-                                    phone_in_frame = True
+                        if silence_gap > 6:
+                            sev = "LOW" if direction == "DOWN" and not has_transcript else "MEDIUM"
 
-                                # other prohibited objects
-                                elif any(x in cls for x in ["book","laptop","tablet","earphone","airpod","headphone","notebook"]):
-                                    add_v("prohibited_object", f"Detected: {cls}", "MEDIUM")
+                            add_v(
+                                "sustained_gaze",
+                                f"Looking {direction} continuously for {elapsed:.1f}s {down_flag_msg}",
+                                sev
+                            )
 
-                        # multi-frame counter: phone must appear in 5 consecutive checks
-                        if phone_in_frame:
-                            phone_counter += 1
-                            print(f"[PHONE] YOLO candidate frame {phone_counter}/5 at t={current_time:.0f}s")
+                        offscreen_start = current_time
+                        offscreen_dir   = direction
 
-                            if phone_counter >= 5:
-                                # GPT-4o vision verification before flagging
-                                # Prevents false positives from YOLO misclassifying
-                                # remotes, wallets, notebooks, hands etc as phones
-                                verified = _verify_phone_with_gpt4o(rgb)
-                                if verified:
-                                    add_v("phone_detected", "Phone confirmed by vision AI", "HIGH")
-                                    phone_counter = 0  # reset after confirmed flag
-                                else:
-                                    print(f"[PHONE] GPT-4o rejected YOLO phone detection at t={current_time:.0f}s -- false positive suppressed")
-                                    phone_counter = 0  # reset -- was a false positive
-                        else:
-                            phone_counter = 0
+                else:
+                    offscreen_start = None
+                    offscreen_dir   = None
+                # =================================================
 
-                    except:
-                        pass
-                
         cap.release()
+
         print(f"[PHASE 3] Processed {processed} frames, {len(gaze_log)} gaze readings, {len(violations)} raw violations")
-
-       
-
         # -- PHASE 4: Pattern analysis ------------------------------------------
         print(f"\n[PHASE 4] Gaze direction pattern analysis")
+
         patterns = detect_direction_patterns(
             gaze_log,
-            min_occurrences = self.dir_min_occ,
-            window_s        = self.dir_window,
+            min_occurrences=self.dir_min_occ,
+            window_s=self.dir_window,
         )
 
         direction_counts = Counter(g["direction"] for g in gaze_log)
         total_tracked    = len(gaze_log) or 1
+
         gaze_pattern = {
-            "LEFT_pct":             round(direction_counts.get("LEFT",  0) / total_tracked * 100, 1),
-            "RIGHT_pct":            round(direction_counts.get("RIGHT", 0) / total_tracked * 100, 1),
-            "DOWN_pct":             round(direction_counts.get("DOWN",  0) / total_tracked * 100, 1),
-            "CENTER_pct":           round(direction_counts.get("CENTER",0) / total_tracked * 100, 1),
-            "ABSENT_pct":           round(direction_counts.get("ABSENT",0) / total_tracked * 100, 1),
+            "LEFT_pct":   round(direction_counts.get("LEFT", 0)   / total_tracked * 100, 1),
+            "RIGHT_pct":  round(direction_counts.get("RIGHT", 0)  / total_tracked * 100, 1),
+            "DOWN_pct":   round(direction_counts.get("DOWN", 0)   / total_tracked * 100, 1),
+            "CENTER_pct": round(direction_counts.get("CENTER", 0) / total_tracked * 100, 1),
+            "ABSENT_pct": round(direction_counts.get("ABSENT", 0) / total_tracked * 100, 1),
             "total_glances_logged": len(gaze_log),
-            "repeated_patterns":    patterns,
-            "has_transcript":       has_transcript,
+            "repeated_patterns": patterns,
+            "has_transcript": has_transcript,
         }
 
         print(f"[PHASE 4] LEFT={gaze_pattern['LEFT_pct']}% RIGHT={gaze_pattern['RIGHT_pct']}% DOWN={gaze_pattern['DOWN_pct']}% CENTER={gaze_pattern['CENTER_pct']}% ABSENT={gaze_pattern['ABSENT_pct']}%")
         print(f"[PHASE 4] Suspicious patterns: {len(patterns)}")
+
         for p in patterns:
             print(f"          -> {p['detail']}")
 
+        # Add violations for repeated patterns
         for p in patterns:
-            if self._can_add(f"pattern_{p['direction']}", p["time_s"]):
+            if self._can_add(f"pattern{p['direction']}", p["time_s"]):
                 violations.append(Violation(
-                    0, p["time_s"],
+                    0,
+                    p["time_s"],
                     "repeated_direction_pattern",
                     p["detail"],
                     "HIGH"
                 ))
 
-        # -- SCORING -----------------------------------------------------------
+        # -- SCORING (Gaze-only, realistic weights) ------------------------------
+
         counts = {
-            "third_person_detected":      sum(1 for v in violations if v.type=="third_person_detected"),
-            "phone_detected":             sum(1 for v in violations if v.type=="phone_detected"),
-            "prohibited_object":          sum(1 for v in violations if v.type=="prohibited_object"),
-            "sustained_gaze":             sum(1 for v in violations if v.type=="sustained_gaze"),
-            "repeated_direction_pattern": sum(1 for v in violations if v.type=="repeated_direction_pattern"),
+            "sustained_gaze":             sum(1 for v in violations if v.type == "sustained_gaze"),
+            "repeated_direction_pattern": sum(1 for v in violations if v.type == "repeated_direction_pattern"),
         }
 
-        # sustained_gaze without a transcript is much weaker evidence -- weight it less
-        sustained_weight = 12 if has_transcript else 6
+        pattern_weight   = 12   # strong signal
+        sustained_weight = 5    # weak signal 
 
         raw = (
-            counts["third_person_detected"]      * 25 +
-            counts["phone_detected"]             * 22 +
-            min(counts["repeated_direction_pattern"] * 6, 40) +
-            counts["prohibited_object"]          * 15 +
-            counts["sustained_gaze"]             * sustained_weight
+            min(counts["repeated_direction_pattern"] * pattern_weight, 60) +
+            counts["sustained_gaze"] * sustained_weight
         )
 
-        dominant_pct = max(gaze_pattern["LEFT_pct"], gaze_pattern["RIGHT_pct"], gaze_pattern["DOWN_pct"])
-        if dominant_pct > 65:
-            boost = 15
-            raw  += boost
+        # dominance boost (more strict now)
+        dominant_pct = max(
+            gaze_pattern["LEFT_pct"],
+            gaze_pattern["RIGHT_pct"],
+            gaze_pattern["DOWN_pct"]
+        )
+
+        if dominant_pct > 75:
+            boost = 10
+            raw += boost
             print(f"[SCORE] Direction dominance boost: +{boost} ({dominant_pct:.0f}% off-center)")
 
         score = min(100, raw)
-        risk  = "HIGH" if score >= 60 else "MEDIUM" if score >= 25 else "LOW"
 
-        # -- Build summary ------------------------------------------------------
+        # risk thresholds (adjusted for gaze-only)
+        if score >= 55:
+            risk = "HIGH"
+        elif score >= 25:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+
+        # -- SUMMARY -------------------------------------------------------------
+
         parts = []
+
         if not has_transcript:
-            parts.append("[WARN] No audio transcript (ffmpeg missing) -- gaze analysis used conservative thresholds")
-        if counts["third_person_detected"] > 0:
-            parts.append(f"3rd person {counts['third_person_detected']}x")
-        if counts["phone_detected"] > 0:
-            parts.append(f"Phone {counts['phone_detected']}x")
+            parts.append("[WARN] No transcript -- gaze-only analysis")
+
         if counts["repeated_direction_pattern"] > 0:
-            dirs     = [p["direction"] for p in patterns]
+            dirs = [p["direction"] for p in patterns]
             dominant = Counter(dirs).most_common(1)[0][0] if dirs else "unknown"
             parts.append(f"Repeated {dominant} look {counts['repeated_direction_pattern']}x")
-        if counts["prohibited_object"] > 0:
-            parts.append(f"Notes/objects {counts['prohibited_object']}x")
+
         if counts["sustained_gaze"] > 0:
-            parts.append(f"Sustained silent gaze off-screen {counts['sustained_gaze']}x")
-        if gaze_pattern["LEFT_pct"] > 25:
-            parts.append(f"Eyes LEFT {gaze_pattern['LEFT_pct']}% of interview")
-        if gaze_pattern["RIGHT_pct"] > 25:
-            parts.append(f"Eyes RIGHT {gaze_pattern['RIGHT_pct']}% of interview")
-        if gaze_pattern["DOWN_pct"] > 20:
-            parts.append(f"Eyes DOWN {gaze_pattern['DOWN_pct']}% of interview")
+            parts.append(f"Sustained off-screen gaze {counts['sustained_gaze']}x")
+
+        if gaze_pattern["LEFT_pct"] > 30:
+            parts.append(f"Eyes LEFT {gaze_pattern['LEFT_pct']}%")
+
+        if gaze_pattern["RIGHT_pct"] > 30:
+            parts.append(f"Eyes RIGHT {gaze_pattern['RIGHT_pct']}%")
+
+        if gaze_pattern["DOWN_pct"] > 35:
+            parts.append(f"Eyes DOWN {gaze_pattern['DOWN_pct']}%")
 
         summary = " | ".join(parts) if parts else "No suspicious activity detected"
+
+        # -- FINAL OUTPUT --------------------------------------------------------
 
         print(f"\n[RESULT] Score={score}/100 | Risk={risk}")
         print(f"[RESULT] {summary}")
         print(f"[RESULT] Violations breakdown: {counts}")
         print(f"[RESULT] All violations ({len(violations)} total):")
+
         for v in violations:
             print(f"         [{v.severity}] t={v.time_s}s  {v.type}: {v.detail}")
+
         print(f"{'='*60}\n")
+
+        # -- STORE RESULT --------------------------------------------------------
 
         result.violations       = violations
         result.processed_frames = processed
@@ -1233,5 +1129,6 @@ class InterviewCheatingDetector:
         result.gaze_pattern     = gaze_pattern
         result.timeline         = timeline
         result.summary          = summary
+
         return result
 
