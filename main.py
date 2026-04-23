@@ -31,7 +31,6 @@ def run_analysis(job_id, video_path, student_id):
             student_id=student_id,
             process_every_n_frames=3,
             offscreen_duration_s=8.0,
-            object_conf=0.55,
             cooldown_s=15.0,
             dir_min_occurrences=6,
             dir_window_s=35.0,
