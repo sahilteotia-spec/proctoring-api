@@ -4,13 +4,24 @@ import json
 import tempfile
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
-
 from detector import InterviewCheatingDetector
 
 app = FastAPI()
-
 JOBS_DIR = Path("/tmp/jobs")
 JOBS_DIR.mkdir(exist_ok=True)
+
+def make_json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    elif isinstance(obj, (bool, int, float, str)) or obj is None:
+        return obj
+    else:
+        try:
+            return obj.item()  # handles numpy types
+        except:
+            return str(obj)
 
 def save_job(job_id, data):
     with open(JOBS_DIR / f"{job_id}.json", "w") as f:
@@ -36,7 +47,8 @@ def run_analysis(job_id, video_path, student_id):
             dir_window_s=35.0,
         )
         result = detector.analyze()
-        save_job(job_id, {"status": "done", "result": result.to_dict()})
+        safe_result = make_json_safe(result.to_dict())
+        save_job(job_id, {"status": "done", "result": safe_result})
     except Exception as e:
         save_job(job_id, {"status": "failed", "error": str(e)})
     finally:
