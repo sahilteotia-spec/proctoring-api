@@ -3,6 +3,7 @@ uvicorn[standard]
 opencv-python-headless
 mediapipe==0.10.18
 openai
+groq
 numpy
 ultralytics
 pytesseract
