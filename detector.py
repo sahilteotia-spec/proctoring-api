@@ -1,3 +1,5 @@
+
+
 import sys
 import traceback
 
@@ -21,8 +23,17 @@ import mediapipe as mp
 import openai
 import base64
 
+from groq import Groq
+
+
 # -- API client (OpenAI only) ---------------------------------------------------
-openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+open_ai_key=os.environ.get("OPENAI_API_KEY")
+openai_client = openai.OpenAI(api_key=open_ai_key) 
+
+
+groqs_key=os.environ.get("GROQ_API_KEY")
+groq_client=Groq(api_key=groqs_key)
+
 
 # -- MediaPipe -----------------------------------------------------------------
 mp_face_mesh   = mp.solutions.face_mesh
@@ -172,7 +183,7 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
     try:
         size_mb    = Path(audio_path).stat().st_size / 1024 / 1024
         duration_s = get_audio_duration(audio_path)
-        print(f"[WHISPER] Audio: {size_mb:.1f}MB, {duration_s:.0f}s")
+        print(f"[WHISPER] Groq Audio: {size_mb:.1f}MB, {duration_s:.0f}s")
 
         CHUNK_MINUTES = 10
         CHUNK_S       = CHUNK_MINUTES * 60
@@ -191,8 +202,8 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
             print(f"[WHISPER] Transcribing chunk offset={offset_s:.0f}s size={chunk_mb:.1f}MB")
 
             with open(chunk_path, "rb") as f:
-                response = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
+                response = groq_client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
                     file=f,
                     response_format="verbose_json",
                     timestamp_granularities=["segment"]
@@ -201,11 +212,18 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
             full_text_parts.append(response.text)
 
             for seg in (response.segments or []):
-                all_segments.append({
-                    "start": round(seg.start + offset_s, 2),
-                    "end":   round(seg.end   + offset_s, 2),
-                    "text":  seg.text.strip(),
-                })
+                if isinstance(seg, dict):
+                    all_segments.append({
+                        "start": round(seg["start"] + offset_s, 2),
+                        "end":   round(seg["end"]   + offset_s, 2),
+                        "text":  seg["text"].strip(),
+                    })
+                else:
+                    all_segments.append({
+                        "start": round(seg.start + offset_s, 2),
+                        "end":   round(seg.end   + offset_s, 2),
+                        "text":  seg.text.strip(),
+                    })
 
             if chunk_path != audio_path:
                 try: Path(chunk_path).unlink()
@@ -220,7 +238,7 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
             "language":  response.language,
         }
     except Exception as e:
-        print(f"[WHISPER] Failed: {e}")
+        print(f"[WHISPER] Groq Failed: {e}")
         return None
 
 
@@ -301,7 +319,7 @@ Respond ONLY in this exact JSON format, no other text:
 }}"""
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -312,7 +330,7 @@ Respond ONLY in this exact JSON format, no other text:
         return parsed
 
     except Exception as e:
-        print(f"[GPT] identify_interviewee_name failed: {e}")
+        print(f"[GPT-4o-MINI] identify_interviewee_name failed: {e}")
         return {"interviewee_name": None, "summary": f"Error: {e}", "interview_topic": "unknown"}
 
 
@@ -448,7 +466,7 @@ Respond ONLY in this exact JSON format, no other text:
 }}"""
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             max_tokens=400,
             messages=[{
                 "role": "user",
@@ -982,7 +1000,7 @@ class InterviewCheatingDetector:
                 transcript_segments = transcript.get("segments", [])
                 has_transcript      = len(transcript_segments) > 0
 
-                print(f"[PHASE 1] Asking GPT-4o to identify interviewee...")
+                print(f"[PHASE 1] Asking GPT-4o-MINI to identify interviewee...")
                 info = identify_interviewee_name(transcript)
                 interviewee_name   = info.get("interviewee_name")
                 transcript_summary = info.get("summary", "")
@@ -1035,7 +1053,7 @@ class InterviewCheatingDetector:
         crop_h           = y2 - y1
         interviewer_side = region.get("interviewer_side", "NONE")
         print(f"[PHASE 2] Region: ({x1},{y1})->({x2},{y2}) size={crop_w}x{crop_h} method={region['method']}")
-        print(f"[PHASE 2] Interviewer is on {interviewer_side} side -- glances that direction will be ignored")
+       
 
         if has_transcript:
             down_flag_dur = 20.0
@@ -1326,4 +1344,3 @@ class InterviewCheatingDetector:
         result.summary          = summary
 
         return result
-
