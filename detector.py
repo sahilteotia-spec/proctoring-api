@@ -523,7 +523,7 @@ def find_largest_face_region(video_path: str, frame_w: int, frame_h: int) -> dic
     best_area = 0
     best_box  = None
 
-    with mp_face_detect.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
+    with mp_face_detect.FaceDetection(model_selection=1, min_detection_confidence=0.3) as fd:
         for t in [5, 15, 30, 45, 60, 75, 90, 105, 120]:
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
             ret, frame = cap.read()
@@ -1086,12 +1086,12 @@ class InterviewCheatingDetector:
             static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
         ) as face_mesh, \
         mp_face_detect.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5,
+            model_selection=1,
+            min_detection_confidence=0.3,
         ) as face_det:
 
             frame_idx = 0
