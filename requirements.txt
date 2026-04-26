@@ -6,6 +6,5 @@ openai
 groq
 numpy
 ultralytics
-pytesseract
 Pillow
 python-multipart
