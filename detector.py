@@ -288,7 +288,7 @@ def split_audio(audio_path: str, chunk_s: int) -> list:
 
 
 # ==============================================================================
-# STEP 3 -- OpenAI identifies interviewee name + summary
+# STEP 3 -- Opneai identifies interviewee name + summary
 # ==============================================================================
 def identify_interviewee_name(transcript: dict) -> dict:
     try:
@@ -339,82 +339,14 @@ Respond ONLY in this exact JSON format, no other text:
 # ==============================================================================
 def find_interviewee_region_by_ocr(video_path: str, interviewee_name: Optional[str], frame_w: int, frame_h: int) -> dict:
     if interviewee_name:
-        region = _ocr_find_name(video_path, interviewee_name, frame_w, frame_h)
+        region = _openai_vision_find_interviewee(video_path, interviewee_name, frame_w, frame_h)
         if region:
             return region
-        print("[REGION] OCR failed -- trying OpenAI Vision")
-
-    region = _openai_vision_find_interviewee(video_path, interviewee_name, frame_w, frame_h)
-    if region:
-        return region
-    print("[REGION] OpenAI Vision failed -- using largest face fallback")
+        print("[REGION] Groq Vision Failed -- trying largest face fallback")
 
     return find_largest_face_region(video_path, frame_w, frame_h)
 
 
-def _ocr_find_name(video_path: str, interviewee_name: str, frame_w: int, frame_h: int) -> Optional[dict]:
-    try:
-        import pytesseract
-        from PIL import Image
-
-        cap        = cv2.VideoCapture(video_path)
-        first_name = interviewee_name.split()[0].lower()
-        last_name  = interviewee_name.split()[-1].lower() if len(interviewee_name.split()) > 1 else ""
-
-        for t in [5, 15, 30, 60, 90, 120, 180]:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            strip_y = int(frame_h * 0.65)
-            bottom  = frame[strip_y:, :]
-            gray    = cv2.cvtColor(bottom, cv2.COLOR_BGR2GRAY)
-
-            for thresh_val in [160, 180, 200]:
-                _, thresh = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
-                data = pytesseract.image_to_data(
-                    Image.fromarray(thresh),
-                    output_type=pytesseract.Output.DICT,
-                    config="--psm 11 --oem 3"
-                )
-
-                for i, word in enumerate(data["text"]):
-                    word_lower = word.lower().strip()
-                    if not word_lower or len(word_lower) < 3:
-                        continue
-
-                    if first_name in word_lower or (last_name and last_name in word_lower):
-                        nx = data["left"][i]
-                        ny = data["top"][i] + strip_y
-                        nw = max(data["width"][i], 80)
-
-                        print(f"[OCR] Matched '{word}' at t={t}s pos=({nx},{ny})")
-                        cap.release()
-
-                        tile_x1 = max(0,       nx - 60)
-                        tile_x2 = min(frame_w, nx + nw + 200)
-                        tile_w  = tile_x2 - tile_x1
-                        tile_h  = int(tile_w * 9 / 16)
-                        tile_y1 = max(0,       ny - tile_h)
-                        tile_y2 = min(frame_h, ny + 30)
-
-                        return {
-                            "x1": tile_x1, "y1": tile_y1,
-                            "x2": tile_x2, "y2": tile_y2,
-                            "method": "ocr",
-                            "name_found": word,
-                        }
-
-        cap.release()
-        return None
-
-    except ImportError:
-        print("[OCR] pytesseract not installed")
-        return None
-    except Exception as e:
-        print(f"[OCR] Error: {e}")
-        return None
 
 
 
@@ -432,7 +364,7 @@ def _openai_vision_find_interviewee(video_path: str, interviewee_name: Optional[
                 if cv2.mean(frame)[0] > 20:
                     
                     frame_to_use = frame
-                    print(f"[VISION] Using frame at t={t}s")
+                    print(f"[Groq VISION] Using frame at t={t}s")
                     break
         cap.release()
 
