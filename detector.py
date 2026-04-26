@@ -417,10 +417,12 @@ def _ocr_find_name(video_path: str, interviewee_name: str, frame_w: int, frame_h
         return None
 
 
+
+
 def _openai_vision_find_interviewee(video_path: str, interviewee_name: Optional[str], frame_w: int, frame_h: int) -> Optional[dict]:
-    """Uses GPT-4o vision to locate the interviewee tile."""
+    """Uses vision model to locate the interviewee tile using normalized coordinates."""
     try:
-        cap          = cv2.VideoCapture(video_path)
+        cap= cv2.VideoCapture(video_path)
         frame_to_use = None
 
         for t in [30, 60, 15, 90, 10]:
@@ -428,6 +430,7 @@ def _openai_vision_find_interviewee(video_path: str, interviewee_name: Optional[
             ret, frame = cap.read()
             if ret and frame is not None:
                 if cv2.mean(frame)[0] > 20:
+                    
                     frame_to_use = frame
                     print(f"[VISION] Using frame at t={t}s")
                     break
@@ -436,94 +439,190 @@ def _openai_vision_find_interviewee(video_path: str, interviewee_name: Optional[
         if frame_to_use is None:
             return None
 
+        # Encode image
         _, buf    = cv2.imencode(".jpg", frame_to_use, [cv2.IMWRITE_JPEG_QUALITY, 85])
         b64_frame = base64.b64encode(buf).decode("utf-8")
+
         name_hint = f"The interviewee's name is '{interviewee_name}'." if interviewee_name else ""
 
-        prompt = f"""This is a screenshot from a video interview recorded on Google Meet or Zoom.
-{name_hint}
-
-The interviewee is the person BEING interviewed (answering questions about their experience/skills).
-The interviewer is the person ASKING the questions.
-
-Look at the screen carefully:
-- Name labels appear at the bottom of each person's video tile
-- The layout could be: one big tile, side by side, big+small thumbnail, etc.
-- There may be an avatar/initial circle if someone has camera off
-
-The full frame is {frame_w}x{frame_h} pixels.
-
-Respond ONLY in this exact JSON format, no other text:
-{{
-  "interviewee_name_on_screen": "name you can read from the screen",
-  "tile_x1": left edge pixel of interviewee tile,
-  "tile_y1": top edge pixel of interviewee tile,
-  "tile_x2": right edge pixel of interviewee tile,
-  "tile_y2": bottom edge pixel of interviewee tile,
-  "interviewer_side": "LEFT or RIGHT or TOP or BOTTOM or NONE",
-  "confidence": "HIGH or MEDIUM or LOW",
-  "reasoning": "brief explanation"
-}}"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=400,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url":    f"data:image/jpeg;base64,{b64_frame}",
-                            "detail": "high",
-                        }
-                    },
-                    {"type": "text", "text": prompt}
-                ]
-            }]
+        system_msg = (
+            "You are a JSON-only API. You NEVER write explanations, sentences, or analysis. "
+            "You output ONLY a single raw JSON object and nothing else. "
+            "No markdown, no backticks, no preamble, no postamble. Just the JSON."
         )
 
-        text   = response.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
-        parsed = json.loads(text)
+        prompt = f"""Image: screenshot from a Google Meet / Zoom interview.
+{name_hint}
 
-        x1 = max(0,       int(parsed["tile_x1"]))
-        y1 = max(0,       int(parsed["tile_y1"]))
-        x2 = min(frame_w, int(parsed["tile_x2"]))
-        y2 = min(frame_h, int(parsed["tile_y2"]))
+Task: identify the interviewee tile (person answering questions, usually largest tile).
+Important:
 
-        print(f"[VISION] GPT-4o identified: '{parsed.get('interviewee_name_on_screen')}' at ({x1},{y1})->({x2},{y2}) confidence={parsed.get('confidence')}")
-        print(f"[VISION] Reasoning: {parsed.get('reasoning')}")
+- There may be multiple people visible (interviewer + interviewee)
+- The interviewee is the person answering questions
+- The interviewee's name is: {interviewee_name}
 
-        if x2 - x1 < 50 or y2 - y1 < 50:
-            print("[VISION] Region too small, ignoring")
+PRIORITY RULES:
+
+1. If a name label matching the interviewee_name is visible, you MUST choose that tile
+2. If multiple faces exist, you MUST NOT choose randomly
+3. The face linked to interviewee_name has highest priority over all other faces
+4. If no name label is visible, choose the person who appears to be the main speaker (larger or more centered tile)
+5. IGNORE code/editor or screen share content completely
+6. Always return a region containing a human face, never a screen area
+7. Do NOT assume the largest tile is always the interviewee
+8. The bounding box MUST contain ONLY ONE face (never multiple people)
+
+FAIL CONDITIONS (DO NOT DO):
+- Do NOT return a wide region covering multiple participants
+- Do NOT include interviewer + interviewee together
+- Do NOT select empty or screen regions
+
+Output ONLY this JSON object, nothing else:
+{{"interviewee_name_on_screen":"<name or empty string>","region":{{"x1_pct":<0.0-1.0>,"y1_pct":<0.0-1.0>,"x2_pct":<0.0-1.0>,"y2_pct":<0.0-1.0>}},"layout_type":"<SINGLE|SIDE_BY_SIDE|GRID|BIG_PLUS_SMALL>","interviewer_side":"<LEFT|RIGHT|TOP|BOTTOM|NONE>","confidence":"<HIGH|MEDIUM|LOW>","reasoning":"<10 words max>"}}"""
+
+        # ================= MODEL CALL =================
+        raw_text = None
+        last_err = None
+
+        for attempt in range(3):
+            try:
+                response = groq_client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    max_tokens=400,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{b64_frame}",
+                                    }
+                                },
+                                {"type": "text", "text": prompt}
+                            ]
+                        }
+                    ]
+                )
+                content = response.choices[0].message.content
+                if content and content.strip():
+                    raw_text = content.strip()
+                    break
+                print(f"[VISION] Attempt {attempt+1}: empty response, retrying...")
+            except Exception as e:
+                last_err = e
+                print(f"[VISION] Attempt {attempt+1} exception: {e}")
+
+        if not raw_text:
+            print(f"[VISION] All attempts failed (last={last_err}) -- falling back")
+            return None
+
+        # ================= PARSE =================
+        import re
+
+        text = raw_text.replace("```json", "").replace("```", "").strip()
+
+        if not text.startswith("{"):
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                text = m.group(0)
+            else:
+                print(f"[VISION] No JSON found in response: {text[:200]}")
+                return None
+
+        # Try strict parse first, fall back to regex extraction
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            print(f"[VISION] JSON parse error: {e} | raw: {text[:300]}")
+            # Regex fallback — extract region coords and other fields individually
+            region_match = re.search(
+                r'"x1_pct"\s*:\s*([0-9.]+).*?"y1_pct"\s*:\s*([0-9.]+).*?"x2_pct"\s*:\s*([0-9.]+).*?"y2_pct"\s*:\s*([0-9.]+)',
+                text, re.DOTALL
+            )
+            if not region_match:
+                print("[VISION] Regex fallback also failed")
+                return None
+
+            confidence   = "HIGH" if "HIGH" in text else "MEDIUM" if "MEDIUM" in text else "LOW"
+            layout_match = re.search(r'"layout_type"\s*:\s*"([^"]+)"', text)
+            side_match   = re.search(r'"interviewer_side"\s*:\s*"([^"]+)"', text)
+            name_match   = re.search(r'"interviewee_name_on_screen"\s*:\s*"([^"]*)"', text)
+
+            parsed = {
+                "region": {
+                    "x1_pct": float(region_match.group(1)),
+                    "y1_pct": float(region_match.group(2)),
+                    "x2_pct": float(region_match.group(3)),
+                    "y2_pct": float(region_match.group(4)),
+                },
+                "confidence":                 confidence,
+                "layout_type":                layout_match.group(1) if layout_match else "",
+                "interviewer_side":           side_match.group(1)   if side_match   else "NONE",
+                "interviewee_name_on_screen": name_match.group(1)   if name_match   else "",
+                "reasoning":                  "",
+            }
+
+        # ================= EXTRACT REGION =================
+        region = parsed.get("region", {})
+
+        x1_pct = float(region.get("x1_pct", 0))
+        y1_pct = float(region.get("y1_pct", 0))
+        x2_pct = float(region.get("x2_pct", 1))
+        y2_pct = float(region.get("y2_pct", 1))
+
+        # Clamp (safety)
+        x1_pct = max(0.0, min(1.0, x1_pct))
+        y1_pct = max(0.0, min(1.0, y1_pct))
+        x2_pct = max(0.0, min(1.0, x2_pct))
+        y2_pct = max(0.0, min(1.0, y2_pct))
+
+        # Convert to pixels
+        x1 = int(x1_pct * frame_w)
+        y1 = int(y1_pct * frame_h)
+        x2 = int(x2_pct * frame_w)
+        y2 = int(y2_pct * frame_h)
+
+        print(f"[VISION] Interviewee: '{parsed.get('interviewee_name_on_screen')}'")
+        print(f"[VISION] Region (pct): ({x1_pct:.2f},{y1_pct:.2f}) → ({x2_pct:.2f},{y2_pct:.2f})")
+        print(f"[VISION] Region (px): ({x1},{y1}) → ({x2},{y2})")
+        print(f"[VISION] Confidence: {parsed.get('confidence')}")
+        print(f"[VISION] Reason: {parsed.get('reasoning')}")
+
+        # Reject garbage regions
+        if (x2 - x1) < frame_w * 0.1 or (y2 - y1) < frame_h * 0.1:
+            print("[VISION] Region too small → ignoring")
             return None
 
         interviewer_side = parsed.get("interviewer_side", "NONE").upper()
         if interviewer_side not in ["LEFT", "RIGHT"]:
             interviewer_side = "NONE"
 
-        print(f"[VISION] Interviewer is on: {interviewer_side} side of interviewee")
-
         return {
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "method":           "openai_vision",
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "method": "vision_pct",
             "name_found":       parsed.get("interviewee_name_on_screen", ""),
             "confidence":       parsed.get("confidence", ""),
             "reasoning":        parsed.get("reasoning", ""),
+            "layout_type":      parsed.get("layout_type", ""),
             "interviewer_side": interviewer_side,
         }
 
     except Exception as e:
-        print(f"[VISION] OpenAI Vision failed: {e}")
+        print(f"[VISION] Vision failed: {e}")
         return None
-
-
+    
 def find_largest_face_region(video_path: str, frame_w: int, frame_h: int) -> dict:
     cap       = cv2.VideoCapture(video_path)
     best_area = 0
     best_box  = None
 
-    with mp_face_detect.FaceDetection(model_selection=1, min_detection_confidence=0.3) as fd:
+    with mp_face_detect.FaceDetection(model_selection=1, min_detection_confidence=0.5) as fd:
         for t in [5, 15, 30, 45, 60, 75, 90, 105, 120]:
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
             ret, frame = cap.read()
@@ -932,7 +1031,162 @@ def analyze_speech_naturalness(transcript_segments: list, min_local_score: int =
         "violations":              violations,
     }
 
+def detect_screen_share_time(transcript_segments):
+    keywords = [
+        "share your screen",
+        "can you share screen",
+        "please share screen",
+        "start sharing",
+        "screen share",
+        "show your code",
+        "open your editor",
+        "write code"
+    ]
 
+    for seg in transcript_segments:
+        text = seg["text"].lower()
+
+        if any(k in text for k in keywords):
+            print(f"[SCREEN SHARE] Detected at t={seg['start']}s -> '{seg['text'][:60]}'")
+            return seg["start"]
+
+    return None
+
+def get_frame_at_time(video_path, time_s):
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, time_s * 1000)
+
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        print("[SCREEN SHARE] Failed to grab frame")
+        return None
+
+    return frame
+
+def openai_vision_find_interviewee_from_frame(frame, interviewee_name, frame_w, frame_h):
+    try:
+        # Encode frame
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64_frame = base64.b64encode(buf).decode("utf-8")
+
+        name_hint = f"The interviewee's name is '{interviewee_name}'." if interviewee_name else ""
+
+        system_msg = "You are a JSON-only API. Output ONLY valid JSON. "
+        "Do not include quotes inside numbers. No trailing commas. No explanations."
+
+        prompt = f"""
+Image: screenshot from a coding interview after screen share.
+{name_hint}
+
+Important:
+
+- Layout may have changed (screen share active)
+- There may be multiple people visible (interviewer + interviewee)
+- The interviewee is the person answering questions
+- The interviewee's name is: {interviewee_name}
+
+PRIORITY RULES:
+1. If a name label matching the interviewee_name is visible, choose that tile
+2. If multiple faces exist, DO NOT choose randomly
+3. Prefer the face associated with the interviewee_name label
+4. If name is not visible, choose the main speaker (larger/center tile)
+5. IGNORE code/editor or screen share content completely
+6. Always return a region containing a human face
+7. IGNORE code/editor or screen share content completely
+8. Always return a region containing a human face, never a screen area
+9. Do NOT assume the largest tile is always the interviewee
+10. The bounding box MUST contain ONLY ONE face (never multiple people)
+
+FAIL CONDITIONS (DO NOT DO):
+- Do NOT return a wide region covering multiple participants
+- Do NOT include interviewer + interviewee together
+- Do NOT select empty or screen regions
+
+
+Return ONLY:
+{{"region":{{"x1_pct":0-1,"y1_pct":0-1,"x2_pct":0-1,"y2_pct":0-1}},
+"confidence":"HIGH|MEDIUM|LOW",
+"reason":"<10 words>"}}"""
+
+        # CALL MODEL
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            max_tokens=300,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_frame}",
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+        )
+        import re
+        import json
+
+        raw = response.choices[0].message.content
+
+        print("[VISION-SS RAW]:", raw[:200])
+
+        if not raw:
+            return None
+
+        # Remove markdown
+        text = raw.replace("```json", "").replace("```", "").strip()
+
+        
+        # Extract ONLY the region block manually
+        region_match = re.search(
+            r'"x1_pct"\s*:\s*([0-9.]+)[,\s]+(?:"y1_pct"\s*:\s*)?([0-9.]+).*?"x2_pct"\s*:\s*([0-9.]+)[,\s]+(?:"y2_pct"\s*:\s*)?([0-9.]+)',
+            text,
+            re.DOTALL
+        )
+        if not region_match:
+            print("[VISION-SS] Could not extract region")
+            return None
+
+        try:
+            x1_pct = float(region_match.group(1))
+            y1_pct = float(region_match.group(2))
+            x2_pct = float(region_match.group(3))
+            y2_pct = float(region_match.group(4))
+        except:
+            print("[VISION-SS] Failed to parse numbers")
+            return None
+
+        # Optional fields
+        confidence = "LOW"
+        if "HIGH" in text:
+            confidence = "HIGH"
+        elif "MEDIUM" in text:
+            confidence = "MEDIUM"
+
+        # Convert to pixels
+        x1 = int(x1_pct * frame_w)
+        y1 = int(y1_pct * frame_h)
+        x2 = int(x2_pct * frame_w)
+        y2 = int(y2_pct * frame_h)
+
+        return {
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "confidence": confidence,
+            "method": "vision_screen_share"
+        }
+    except Exception as e:
+        print(f"[VISION-SS] Failed: {e}")
+        return None
 # ==============================================================================
 # Main detector class
 # ==============================================================================
@@ -1015,6 +1269,15 @@ class InterviewCheatingDetector:
         result.transcript_full    = transcript_full
         result.transcript_summary = transcript_summary
         result.interview_topic    = interview_topic
+        
+        screen_share_time = None
+
+        if has_transcript:
+            screen_share_time = detect_screen_share_time(transcript_segments)
+
+            if screen_share_time:
+                screen_share_time +=120  # buffer after instruction
+                print(f"[SCREEN SHARE] Adjusted time: {screen_share_time}s")
 
         # -- PHASE 1b: Speech naturalness analysis (local, zero API cost) --------
         print(f"\n[PHASE 1b] Speech naturalness / AI-assisted speech detection")
@@ -1053,7 +1316,43 @@ class InterviewCheatingDetector:
         crop_h           = y2 - y1
         interviewer_side = region.get("interviewer_side", "NONE")
         print(f"[PHASE 2] Region: ({x1},{y1})->({x2},{y2}) size={crop_w}x{crop_h} method={region['method']}")
-       
+        
+        
+        secondary_region = None
+        secondary_start_time = None
+
+        if screen_share_time:
+            print(f"[SCREEN SHARE] Capturing frame at t={screen_share_time}s")
+
+            ss_frame = get_frame_at_time(self.video_path, screen_share_time)
+
+            if ss_frame is not None:
+                
+
+                # Run vision AGAIN on this frame
+                new_region = openai_vision_find_interviewee_from_frame(
+                    ss_frame,
+                    interviewee_name,
+                    frame_w,
+                    frame_h
+                )
+
+                if new_region:
+                    secondary_region = new_region
+                    secondary_start_time = screen_share_time
+
+                    print(f"[SCREEN SHARE] New region: {secondary_region}")
+
+                    sx1, sy1, sx2, sy2 = (
+                        new_region["x1"],
+                        new_region["y1"],
+                        new_region["x2"],
+                        new_region["y2"]
+                    )
+
+                    crop_ss = ss_frame[sy1:sy2, sx1:sx2]
+                   
+            
 
         if has_transcript:
             down_flag_dur = 20.0
@@ -1086,16 +1385,17 @@ class InterviewCheatingDetector:
             static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.3,
-            min_tracking_confidence=0.3,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         ) as face_mesh, \
         mp_face_detect.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.3,
+            model_selection=0,
+            min_detection_confidence=0.5,
         ) as face_det:
 
             frame_idx = 0
-
+            switched_logged=False
+            last_speaking_log_time=-999
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -1109,9 +1409,26 @@ class InterviewCheatingDetector:
 
                 processed += 1
 
-                crop = frame[y1:y2, x1:x2]
+                # decide which region to use
+                if secondary_region and current_time >= secondary_start_time:
+                    if not switched_logged:
+                        print("switched at ",current_time)
+                        rx1, ry1, rx2, ry2 = (
+                            secondary_region["x1"],
+                            secondary_region["y1"],
+                            secondary_region["x2"],
+                            secondary_region["y2"]
+                        )
+                        switched_logged=True
+                        down_flag_dur=30
+                else:
+                    rx1, ry1, rx2, ry2 = x1, y1, x2, y2
+
+                crop = frame[ry1:ry2, rx1:rx2]
                 if crop.size == 0:
                     continue
+                
+                
 
                 rgb    = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                 bucket = min(int(current_time / bucket_size), n_buckets - 1)
@@ -1175,7 +1492,9 @@ class InterviewCheatingDetector:
                     interviewer_speaking = is_interviewer_speaking(current_time, transcript_segments) if has_transcript else False
 
                     if speaking or interviewer_speaking:
-                        print(f"[GAZE] Suppressed at t={current_time:.0f}s -- Speaking/Listening detected")
+                        if current_time-last_speaking_log_time>5:
+                           print(f"[GAZE] Suppressed at t={current_time:.0f}s -- Speaking/Listening detected")
+                           last_speaking_log_time=current_time
                         offscreen_start = None
                         offscreen_dir   = None
                         continue
@@ -1261,31 +1580,38 @@ class InterviewCheatingDetector:
             "ai_assisted_speech":         sum(1 for v in violations if v.type == "ai_assisted_speech"),
         }
 
-        pattern_weight   = 12
-        sustained_weight = 5
+        down_patterns = sum(1 for p in patterns if p["direction"] == "DOWN" and p["count"] >= 6)
+        lr_patterns   = sum(1 for p in patterns if p["direction"] in ["LEFT", "RIGHT"])
 
-        raw = (
-            min(counts["repeated_direction_pattern"] * pattern_weight, 60) +
-            counts["sustained_gaze"] * sustained_weight
-        )
+        lr_score      = min(lr_patterns,   5) * 8
+        if(gaze_pattern["DOWN_pct"]>80):
+            down_patterns=0
+        down_score    = min(down_patterns, 8) * 4
+        pattern_score = lr_score + down_score
 
-        # Speech score contributes up to 30 points
+        sustained_score = min(counts["sustained_gaze"], 6) * 4
+
+        raw = pattern_score + sustained_score
+
         speech_score = speech_naturalness_result.get("overall_ai_speech_score", 0)
-        raw += int(speech_score * 0.30)
+        raw += int(speech_score * 0.45)
 
-        # Dominance boost
         dominant_pct = max(
             gaze_pattern["LEFT_pct"],
             gaze_pattern["RIGHT_pct"],
             gaze_pattern["DOWN_pct"]
         )
         if dominant_pct > 75:
-            boost = 10
+            boost = int((dominant_pct - 75) * 0.6)
             raw  += boost
             print(f"[SCORE] Direction dominance boost: +{boost} ({dominant_pct:.0f}% off-center)")
 
-        score = min(100, raw)
+        if speech_score >= 55 and (lr_patterns + down_patterns) >= 2:
+            pre_boost = raw
+            raw = int(raw * 1.25)
+            print(f"[SCORE] Cross-signal multiplier applied (speech={speech_score}, gaze_patterns={lr_patterns + down_patterns}): {pre_boost} → {raw}")
 
+        score = min(100, raw)
         if score >= 55:
             risk = "HIGH"
         elif score >= 25:
