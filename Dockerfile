@@ -2,7 +2,6 @@ FROM python:3.10-slim
 # System deps: GL + codec libs (the critical ones)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    tesseract-ocr \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
