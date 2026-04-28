@@ -1240,7 +1240,7 @@ class InterviewCheatingDetector:
         # -- PHASE 2: Find interviewee region ------------------------------------
         print(f"\n[PHASE 2] Locating interviewee on screen")
         region = find_interviewee_region_by_ocr(
-            self.video_path, interviewee_name, frame_w, frame_h
+            self.video_path, self.student_id, frame_w, frame_h
         )
         result.interviewee_region = region
         x1, y1, x2, y2  = region["x1"], region["y1"], region["x2"], region["y2"]
@@ -1264,7 +1264,7 @@ class InterviewCheatingDetector:
                 # Run vision AGAIN on this frame
                 new_region = openai_vision_find_interviewee_from_frame(
                     ss_frame,
-                    interviewee_name,
+                    self.student_id,
                     frame_w,
                     frame_h
                 )
