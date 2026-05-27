@@ -265,16 +265,11 @@ class TranscriptExtractor:
         self.student_id = student_id or Path(video_path).stem
 
     def extract(self) -> TranscriptResult:
-        import cv2
-        cap        = cv2.VideoCapture(self.video_path)
-        fps        = cap.get(cv2.CAP_PROP_FPS) or 25
-        total_f    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration_s = total_f / fps
-        cap.release()
+        duration_s = get_audio_duration(self.video_path)
 
         print(f"\n{'='*60}")
         print(f"[EXTRACT] {self.student_id}")
-        print(f"[EXTRACT] Duration: {duration_s:.0f}s  |  Frames: {total_f}")
+        print(f"[EXTRACT] Duration: {duration_s:.0f}s")
         print(f"{'='*60}")
 
         result = TranscriptResult(
