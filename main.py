@@ -1,14 +1,33 @@
-import os
-import uuid
-import json
-import tempfile
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
-from detector import InterviewCheatingDetector
+"""
 
-app = FastAPI()
-JOBS_DIR = Path("/tmp/jobs")
-JOBS_DIR.mkdir(exist_ok=True)
+"""
+
+import os
+import sys
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+
+sys.path.insert(0, str(Path(__file__).parent))
+from detector import TranscriptExtractor
+
+
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "./results"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def check_env():
+    missing = []
+    if not os.environ.get("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
+    if not os.environ.get("GROQ_API_KEY"):
+        missing.append("GROQ_API_KEY")
+    if missing:
+        for key in missing:
+            print(f"[ERROR] {key} is not set.  →  export {key}=your_key_here")
+        sys.exit(1)
+
 
 def make_json_safe(obj):
     if isinstance(obj, dict):
@@ -19,65 +38,66 @@ def make_json_safe(obj):
         return obj
     else:
         try:
-            return obj.item()  # handles numpy types
-        except:
+            return obj.item()          # handles numpy scalar types
+        except Exception:
             return str(obj)
 
-def save_job(job_id, data):
-    with open(JOBS_DIR / f"{job_id}.json", "w") as f:
-        json.dump(data, f)
 
-def load_job(job_id):
-    p = JOBS_DIR / f"{job_id}.json"
-    if not p.exists():
-        return None
-    with open(p) as f:
-        return json.load(f)
+def run(video_path: str, student_id: str = None):
+    video = Path(video_path)
+    if not video.exists():
+        print(f"[ERROR] Video not found: {video_path}")
+        sys.exit(1)
 
-def run_analysis(job_id, video_path, student_id):
-    try:
-        save_job(job_id, {"status": "processing"})
-        detector = InterviewCheatingDetector(
-            video_path=video_path,
-            student_id=student_id,
-            process_every_n_frames=3,
-            offscreen_duration_s=8.0,
-            cooldown_s=15.0,
-            dir_min_occurrences=6,
-            dir_window_s=35.0,
-        )
-        result = detector.analyze()
-        safe_result = make_json_safe(result.to_dict())
-        save_job(job_id, {"status": "done", "result": safe_result})
-    except Exception as e:
-        save_job(job_id, {"status": "failed", "error": str(e)})
-    finally:
-        try:
-            Path(video_path).unlink()
-        except:
-            pass
+    student_id = student_id or video.stem
 
-@app.post("/analyze")
-async def analyze(
-    background_tasks: BackgroundTasks,
-    video: UploadFile,
-    student_id: str = Form(default="unknown"),
-):
-    job_id = str(uuid.uuid4())
-    suffix = Path(video.filename).suffix or ".mp4"
-    tmp = tempfile.mktemp(suffix=suffix)
-    with open(tmp, "wb") as f:
-        f.write(await video.read())
-    background_tasks.add_task(run_analysis, job_id, tmp, student_id)
-    return {"job_id": job_id}
+    print("=" * 60)
+    print(f"  Transcript Extractor")
+    print(f"  Video   : {video}")
+    print(f"  Student : {student_id}")
+    print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
 
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    job = load_job(job_id)
-    if not job:
-        return {"status": "processing"}
-    return job
+    extractor = TranscriptExtractor(
+        video_path=str(video),
+        student_id=student_id,
+    )
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    t0      = time.time()
+    result  = extractor.extract()
+    elapsed = time.time() - t0
+
+    print("\n" + "=" * 60)
+    print("  RESULT SUMMARY")
+    print("=" * 60)
+    print(f"  Interviewee  : {result.interviewee_name}")
+    print(f"  Interviewer  : {result.interviewer_name}")
+    print(f"  Topic        : {result.interview_topic}")
+    print(f"  Language     : {result.language}")
+    print(f"  Duration     : {result.duration_s:.1f}s")
+    print(f"  Transcript   : {len(result.transcript_full)} chars")
+    print(f"  Summary      : {result.transcript_summary}")
+    print(f"  Processed in : {elapsed:.1f}s")
+    print("=" * 60)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file  = OUTPUT_DIR / f"{student_id}_{timestamp}.json"
+
+    data = result.to_dict()
+    data["processing_time_s"] = round(elapsed, 2)
+    data = make_json_safe(data)
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"\n  JSON saved → {out_file}")
+    return result
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python runtest.py <video_path> [student_id]")
+        sys.exit(1)
+
+    check_env()
+    run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
