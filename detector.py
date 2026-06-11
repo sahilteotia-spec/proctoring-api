@@ -15,12 +15,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 import openai
-from groq import Groq
 
 
 # -- API clients ---------------------------------------------------------------
 openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-groq_client   = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 # ==============================================================================
@@ -81,7 +79,7 @@ def extract_audio(video_path: str) -> Optional[str]:
 
 
 # ==============================================================================
-# STEP 2 — Transcribe with Groq Whisper (chunked for long audio)
+# STEP 2 — Transcribe with OpenAI Whisper (chunked for long audio)
 # ==============================================================================
 def get_audio_duration(audio_path: str) -> float:
     try:
@@ -150,8 +148,8 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
             print(f"[WHISPER] Transcribing chunk offset={offset_s:.0f}s  size={chunk_mb:.1f} MB")
 
             with open(chunk_path, "rb") as f:
-                response = groq_client.audio.transcriptions.create(
-                    model="whisper-large-v3-turbo",
+                response = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
                     file=f,
                     response_format="verbose_json",
                     timestamp_granularities=["segment"],
