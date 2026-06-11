@@ -7,18 +7,17 @@ def excepthook(type, value, tb):
 sys.excepthook = excepthook
 
 import os
-import json
 import tempfile
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
-import openai
+from groq import Groq
 
 
 # -- API clients ---------------------------------------------------------------
-openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 # ==============================================================================
@@ -26,27 +25,19 @@ openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 # ==============================================================================
 @dataclass
 class TranscriptResult:
-    student_id:         str
-    video_path:         str
-    duration_s:         float
-    transcript_full:    str  = ""
-    interviewee_name:   str  = "unknown"
-    interviewer_name:   str  = "unknown"
-    interview_topic:    str  = ""
-    transcript_summary: str  = ""
-    language:           str  = ""
+    student_id:      str
+    video_path:      str
+    duration_s:      float
+    transcript_full: str = ""
+    language:        str = ""
 
     def to_dict(self):
         return {
-            "student_id":           self.student_id,
-            "video_path":           self.video_path,
-            "duration_s":           round(self.duration_s, 2),
-            "interviewee_name":     self.interviewee_name,
-            "interviewer_name":     self.interviewer_name,
-            "interview_topic":      self.interview_topic,
-            "transcript_summary":   self.transcript_summary,
-            "language":             self.language,
-            "transcript_full":      self.transcript_full,
+            "student_id":      self.student_id,
+            "video_path":      self.video_path,
+            "duration_s":      round(self.duration_s, 2),
+            "language":        self.language,
+            "transcript_full": self.transcript_full,
         }
 
 
@@ -79,7 +70,7 @@ def extract_audio(video_path: str) -> Optional[str]:
 
 
 # ==============================================================================
-# STEP 2 — Transcribe with OpenAI Whisper (chunked for long audio)
+# STEP 2 — Transcribe with Groq Whisper (chunked for long audio)
 # ==============================================================================
 def get_audio_duration(audio_path: str) -> float:
     try:
@@ -148,8 +139,8 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
             print(f"[WHISPER] Transcribing chunk offset={offset_s:.0f}s  size={chunk_mb:.1f} MB")
 
             with open(chunk_path, "rb") as f:
-                response = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
+                response = groq_client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
                     file=f,
                     response_format="verbose_json",
                     timestamp_granularities=["segment"],
@@ -194,67 +185,6 @@ def transcribe_audio(audio_path: str) -> Optional[dict]:
 
 
 # ==============================================================================
-# STEP 3 — GPT-4o-mini: identify interviewee name + summary
-# ==============================================================================
-def identify_interviewee(transcript: dict) -> dict:
-    fallback = {
-        "interviewee_name": None,
-        "interviewer_name": None,
-        "interview_topic":  "unknown",
-        "summary":          "",
-        "confidence":       "LOW",
-    }
-
-    try:
-        full_text = transcript.get("full_text", "")
-        if not full_text or len(full_text) < 30:
-            print("[GPT] Transcript too short to identify participants.")
-            return fallback
-
-        prompt = f"""You are analyzing a job interview transcript.
-
-TRANSCRIPT:
-{full_text[:5000]}
-
-1. Who is the INTERVIEWEE? (answers questions about background/skills/experience)
-2. Who is the INTERVIEWER? (asks questions)
-3. Extract the interviewee's name if mentioned (e.g. "Hi I'm John" or "Can you introduce yourself, Priya?")
-4. What is the interview about? (job role / skill being evaluated)
-5. Write a 3-5 sentence summary of what was discussed.
-
-Respond ONLY in this exact JSON format, no other text:
-{{
-  "interviewee_name": "first name or full name if found, else null",
-  "interviewer_name": "first name or full name if found, else null",
-  "interview_topic":  "e.g. Oracle EBS Functional Consultant",
-  "summary":          "3-5 sentence summary of the interview",
-  "confidence":       "HIGH or MEDIUM or LOW",
-  "name_mention":     "quote from transcript where name was mentioned, or null"
-}}"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        text   = response.choices[0].message.content.strip()
-        text   = text.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(text)
-
-        print(
-            f"[GPT] Interviewee: {parsed.get('interviewee_name')} | "
-            f"Topic: {parsed.get('interview_topic')} | "
-            f"Confidence: {parsed.get('confidence')}"
-        )
-        return parsed
-
-    except Exception as e:
-        print(f"[GPT] identify_interviewee failed: {e}")
-        return fallback
-
-
-# ==============================================================================
 # Main transcript extractor class
 # ==============================================================================
 class TranscriptExtractor:
@@ -293,16 +223,7 @@ class TranscriptExtractor:
             print("[EXTRACT] Transcription failed.")
             return result
 
-        result.transcript_full     = transcript["full_text"]
-        result.language            = transcript.get("language", "")
-
-        # Step 3 — identify participants
-        print(f"\n[EXTRACT] Identifying participants via GPT-4o-mini...")
-        info = identify_interviewee(transcript)
-
-        result.interviewee_name   = info.get("interviewee_name") or "unknown"
-        result.interviewer_name   = info.get("interviewer_name") or "unknown"
-        result.interview_topic    = info.get("interview_topic",  "")
-        result.transcript_summary = info.get("summary",          "")
+        result.transcript_full = transcript["full_text"]
+        result.language        = transcript.get("language", "")
 
         return result
