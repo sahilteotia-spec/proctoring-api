@@ -1,25 +1,22 @@
-FROM python:3.10-slim
-# System deps: GL + codec libs (the critical ones)
-RUN apt-get update && apt-get install -y \
+FROM python:3.11-slim
+
+# Install system dependencies (ffmpeg and libGL for OpenCV if not using headless)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    #libgl1 \
-    #libglib2.0-0 \
-    #libsm6 \
-    #libxext6 \
-    #libxrender-dev \
-    #libgomp1 \
-    #libavcodec-dev \
-    #libavformat-dev \
-    #libswscale-dev \
-    #libv4l-dev \
-    #gstreamer1.0-plugins-base \
-    #gstreamer1.0-plugins-good \ 
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY detector.py main.py ./
+# Copy application code
+COPY . .
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Expose port 8000
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
