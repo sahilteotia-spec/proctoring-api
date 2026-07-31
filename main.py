@@ -9,8 +9,9 @@ from detector import TranscriptExtractor
 
 app = FastAPI()
 
-JOBS_DIR = Path("/tmp/jobs")
-JOBS_DIR.mkdir(exist_ok=True)
+# Store jobs inside the workspace's results/jobs directory for Windows/Linux cross-compatibility
+JOBS_DIR = Path(__file__).parent / "results" / "jobs"
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def make_json_safe(obj):
@@ -40,13 +41,14 @@ def load_job(job_id):
         return json.load(f)
 
 
-def run_analysis(job_id, video_path, student_id):
+def run_analysis(job_id, video_path, student_id, interviewee_name=""):
     try:
         save_job(job_id, {"status": "processing"})
 
         extractor = TranscriptExtractor(
             video_path=video_path,
             student_id=student_id,
+            interviewee_name=interviewee_name,
         )
         result = extractor.extract()
         safe_result = make_json_safe(result.to_dict())
@@ -66,13 +68,19 @@ async def transcribe(
     background_tasks: BackgroundTasks,
     video: UploadFile,
     student_id: str = Form(default="unknown"),
+    interviewee_name: str = Form(default=""),
 ):
     job_id = str(uuid.uuid4())
     suffix = Path(video.filename).suffix or ".mp4"
-    tmp = tempfile.mktemp(suffix=suffix)
+    
+    # Securely create temp file path
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    
     with open(tmp, "wb") as f:
         f.write(await video.read())
-    background_tasks.add_task(run_analysis, job_id, tmp, student_id)
+        
+    background_tasks.add_task(run_analysis, job_id, tmp, student_id, interviewee_name)
     return {"job_id": job_id}
 
 
