@@ -63,6 +63,8 @@ def run_analysis(job_id, video_path, student_id, interviewee_name=""):
             pass
 
 
+import shutil
+
 @app.post("/transcribe")
 async def transcribe(
     background_tasks: BackgroundTasks,
@@ -78,7 +80,7 @@ async def transcribe(
     os.close(fd)
     
     with open(tmp, "wb") as f:
-        f.write(await video.read())
+        shutil.copyfileobj(video.file, f)
         
     background_tasks.add_task(run_analysis, job_id, tmp, student_id, interviewee_name)
     return {"job_id": job_id}
